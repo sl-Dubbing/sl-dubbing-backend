@@ -1,0 +1,6 @@
+celery
+redis
+cloudinary
+TTS
+torch
+torchaudio
