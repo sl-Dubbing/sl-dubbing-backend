@@ -5,11 +5,13 @@ Features:
 2. Direct Text-to-Speech (TTS) Endpoint with Long Text Splitting.
 3. Cloudflare R2 Integration (Stateless Storage).
 4. Studio Loudness Normalization (EBU R128).
+5. PostgreSQL Database Integration for User Management & Credits.
 """
 import os, uuid, threading, logging, json, time, subprocess, urllib.request, re, unicodedata, random
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
 from deep_translator import GoogleTranslator
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
@@ -47,6 +49,22 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
+
+# ==========================================
+# ── إعدادات قاعدة البيانات (PostgreSQL) ──
+# ==========================================
+# نستخدم رابط السحابة، وإذا لم يجده (في جهازك المحلي) يستخدم ملف SQLite للتجربة
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///local_users.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# ── تعريف جدول المستخدمين ──
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    name = db.Column(db.String(100))
+    credits = db.Column(db.Integer, default=10000) # 10 آلاف حرف مجاني كبداية
+# ==========================================
 
 BASE_DIR    = Path(__file__).parent.absolute()
 AUDIO_DIR   = BASE_DIR / 'temp_audio'
@@ -166,7 +184,6 @@ def tts_generate(xtts, text, wav_ref, lang, out_path, speed=1.0):
 
 def process_audio_segment(clip_path, target_ms):
     if target_ms <= 0:
-        # For TTS where target_ms is 0, just apply standard loudnorm
         tmp_ff = AUDIO_DIR / f"ff_{uuid.uuid4().hex[:6]}.wav"
         try:
             subprocess.run(['ffmpeg', '-i', str(clip_path), '-af', "loudnorm=I=-14:TP=-1.5:LRA=11", '-ar', '44100', '-ac', '2', '-y', str(tmp_ff)], capture_output=True)
@@ -304,6 +321,33 @@ def run_dub_job(job_id, data):
         JOBS[job_id].update({"status": "error", "error": str(e)})
 
 # ── API Routes ──
+
+# ==========================================
+# ── مسار تسجيل/مزامنة المستخدم الجديد ──
+# ==========================================
+@app.route('/api/sync-user', methods=['POST', 'OPTIONS'])
+def sync_user():
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
+        
+    data = request.json
+    user_email = data.get('email')
+    user_name = data.get('name', 'User')
+    
+    # البحث هل المستخدم موجود مسبقاً في PostgreSQL
+    user = User.query.filter_by(email=user_email).first()
+    
+    if not user:
+        # إذا كان مستخدماً جديداً، ننشئ له حساباً ونعطيه 10,000 حرف مجاني كتجربة!
+        new_user = User(email=user_email, name=user_name, credits=10000)
+        db.session.add(new_user)
+        db.session.commit()
+        return jsonify({"message": "تم إنشاء حساب جديد", "credits": 10000}), 201
+        
+    # إذا كان موجوداً، نرسل رصيده الحالي
+    return jsonify({"message": "أهلاً بعودتك", "credits": user.credits}), 200
+# ==========================================
+
 @app.route('/api/upload_audio', methods=['POST'])
 def upload_audio():
     f = request.files['file']; fp = AUDIO_DIR/f"{uuid.uuid4().hex}_{secure_filename(f.filename)}"
@@ -440,4 +484,11 @@ def _download_default_speakers():
 threading.Thread(target=_download_default_speakers, daemon=True).start()
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, threaded=True)
+    # ==========================================
+    # تأكد من إنشاء الجداول في قاعدة البيانات عند التشغيل
+    with app.app_context():
+        db.create_all()
+    # ==========================================
+    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, threaded=True)
