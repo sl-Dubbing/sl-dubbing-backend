@@ -21,6 +21,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# الموافقة التلقائية على شروط Coqui TTS لحل مشكلة الـ Deploy
+os.environ["COQUI_TOS_AGREED"] = "1"
+
 # ============================================================================
 # FLASK, CORS & SECURITY SETUP
 # ============================================================================
@@ -236,6 +239,7 @@ def get_xtts():
         try:
             from TTS.api import TTS
             logger.info("⏳ Loading XTTS v2...")
+            # تجاوز انتظار الموافقة اليدوية على الرخصة
             XTTS_MODEL = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
             ACTIVE_ENGINE = 'xtts'
             logger.info("✅ XTTS v2 loaded successfully")
