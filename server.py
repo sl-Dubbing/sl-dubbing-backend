@@ -1,5 +1,5 @@
 # server.py — sl-Dubbing Backend (Enterprise Edition - SECURED & ENHANCED)
-import os, uuid, time, logging, subprocess, re, json
+import os, uuid, time, logging, subprocess, re, json, gc, sys
 from pathlib import Path
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file
@@ -97,7 +97,7 @@ class DubbingJob(db.Model):
     
     status = db.Column(db.String(20), default='pending')  # pending, processing, completed, failed
     language = db.Column(db.String(10), nullable=False)
-    voice_mode = db.Column(db.String(50), nullable=False)  # 'xtts', 'gtts', 'source'
+    voice_mode = db.Column(db.String(50), nullable=False)  # 'xtts', 'cosy', 'gtts', 'source'
     voice_id = db.Column(db.String(100), nullable=True)
     
     text_length = db.Column(db.Integer, default=0)
@@ -180,29 +180,70 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
 
 VOICE_CACHE = {}
+
+# ============================================================================
+# SMART ENGINE MANAGER (LAZY LOADING)
+# ============================================================================
+
 XTTS_MODEL = None
+COSY_MODEL = None
+ACTIVE_ENGINE = None
 
-# ============================================================================
-# XTTS MODEL INITIALIZATION
-# ============================================================================
-
-def init_xtts():
-    global XTTS_MODEL
-    if XTTS_MODEL is not None:
-        return True
-    try:
-        from TTS.api import TTS
-        logger.info("⏳ Loading XTTS v2...")
-        XTTS_MODEL = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-        logger.info("✅ XTTS v2 loaded successfully")
-        return True
-    except Exception as e:
-        logger.error(f"❌ XTTS initialization failed: {e}")
+def unload_engines():
+    """Unload AI Models to free VRAM and prevent OOM crashes"""
+    global XTTS_MODEL, COSY_MODEL, ACTIVE_ENGINE
+    if XTTS_MODEL is not None or COSY_MODEL is not None:
+        logger.info("🧹 Unloading AI Models to free VRAM...")
         XTTS_MODEL = None
-        return False
+        COSY_MODEL = None
+        ACTIVE_ENGINE = None
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
+def get_cosy():
+    global COSY_MODEL, ACTIVE_ENGINE
+    if ACTIVE_ENGINE == 'xtts': 
+        unload_engines()
+    
+    if COSY_MODEL is None:
+        try:
+            from modelscope import snapshot_download
+            if '/app/CosyVoice' not in sys.path:
+                sys.path.append('/app/CosyVoice')
+            from cosyvoice.cli.cosyvoice import CosyVoice
+            
+            logger.info("⏳ Loading CosyVoice 3.0...")
+            model_dir = snapshot_download('iic/CosyVoice-300M')
+            COSY_MODEL = CosyVoice(model_dir)
+            ACTIVE_ENGINE = 'cosy'
+            logger.info("✅ CosyVoice 3.0 loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ CosyVoice initialization failed: {e}")
+            return None
+    return COSY_MODEL
+
+def get_xtts():
+    global XTTS_MODEL, ACTIVE_ENGINE
+    if ACTIVE_ENGINE == 'cosy': 
+        unload_engines()
+        
+    if XTTS_MODEL is None:
+        try:
+            from TTS.api import TTS
+            logger.info("⏳ Loading XTTS v2...")
+            XTTS_MODEL = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+            ACTIVE_ENGINE = 'xtts'
+            logger.info("✅ XTTS v2 loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ XTTS initialization failed: {e}")
+            return None
+    return XTTS_MODEL
+
+# Start XTTS by default on boot via background thread
 import threading
-init_thread = threading.Thread(target=init_xtts, daemon=True)
+init_thread = threading.Thread(target=get_xtts, daemon=True)
 init_thread.start()
 
 # ============================================================================
@@ -277,14 +318,35 @@ def extract_source_voice(media_url, job_id):
         logger.error(f"Source extraction error: {e}")
         return None
 
+def synthesize_cosy(text, voice_path, output_path):
+    """Generate speech using CosyVoice 3.0"""
+    try:
+        engine = get_cosy()
+        if engine is None:
+            return None, "CosyVoice not ready"
+            
+        from cosyvoice.utils.file_utils import load_wav
+        import torchaudio
+        
+        prompt_speech_16k = load_wav(voice_path, 16000)
+        output = engine.inference_zero_shot(text, "نص العينة للمحاكاة", prompt_speech_16k)
+        torchaudio.save(output_path, output['tts_speech'], 22050)
+        
+        if Path(output_path).exists():
+            return output_path, "cosyvoice"
+        return None, "Empty output"
+    except Exception as e:
+        logger.error(f"CosyVoice error: {e}")
+        return None, str(e)
+
 def synthesize_xtts(text, lang, voice_path, output_path):
     """Generate speech using XTTS v2"""
-    global XTTS_MODEL
     try:
-        if XTTS_MODEL is None:
+        engine = get_xtts()
+        if engine is None:
             return None, "XTTS not ready"
         
-        XTTS_MODEL.tts_to_file(
+        engine.tts_to_file(
             text=text,
             speaker_wav=voice_path,
             language=lang[:2],
@@ -348,7 +410,7 @@ def health():
     return jsonify({
         'status': 'ok',
         'timestamp': datetime.utcnow().isoformat(),
-        'xtts_ready': XTTS_MODEL is not None,
+        'active_engine': ACTIVE_ENGINE,
         'database': 'connected' if db.session.execute(db.text('SELECT 1')) else 'error'
     })
 
@@ -511,18 +573,21 @@ def dub():
         # Process audio
         t0 = time.time()
         voice_path = None
-        use_xtts = False
         
-        if voice_mode == 'source' and media_url:
-            voice_path = extract_source_voice(media_url, job_id)
-            use_xtts = voice_path is not None
-        elif voice_mode == 'xtts' and voice_url:
-            voice_path = fetch_voice_sample(voice_url, voice_id)
-            use_xtts = voice_path is not None
+        # Fetch or Extract Voice Sample
+        if voice_mode in ['source', 'xtts', 'cosy']:
+            if voice_mode == 'source' and media_url:
+                voice_path = extract_source_voice(media_url, job_id)
+            elif voice_url:
+                voice_path = fetch_voice_sample(voice_url, voice_id)
         
         output_path = str(AUDIO_DIR / f"dub_{job_id}.mp3")
+        method = "none"
         
-        if use_xtts and voice_path:
+        # Route to appropriate engine
+        if voice_mode == 'cosy' and voice_path:
+            output_path, method = synthesize_cosy(text, voice_path, output_path)
+        elif (voice_mode == 'xtts' or voice_mode == 'source') and voice_path:
             output_path, method = synthesize_xtts(text, lang, voice_path, output_path)
         else:
             output_path, method = synthesize_gtts(text, lang, output_path)
@@ -533,19 +598,20 @@ def dub():
             db.session.commit()
             return jsonify({'success': False, 'error': 'فشل توليد الصوت'}), 500
         
-        # Upload to CDN or generate public URL
+        # Generate public URL
         audio_url = f"https://{request.host}/api/file/{Path(output_path).name}"
         job.output_url = audio_url
         job.status = 'completed'
         job.processing_time = time.time() - t0
         db.session.commit()
         
-        logger.info(f"✅ Job {job_id} completed in {job.processing_time:.1f}s")
+        logger.info(f"✅ Job {job_id} completed in {job.processing_time:.1f}s via {method}")
         
         return jsonify({
             'success': True,
             'job_id': job_id,
             'audio_url': audio_url,
+            'method': method,
             'processing_time': job.processing_time,
             'remaining_credits': user.credits,
             'message': 'الدبلجة جاهزة للتحميل!'
@@ -563,6 +629,9 @@ def get_file(filename):
         return jsonify({'error': 'File not found'}), 404
     
     mime = 'audio/mpeg'  # MP3 by default
+    if str(p).endswith('.wav'):
+        mime = 'audio/wav'
+        
     return send_file(str(p), mimetype=mime, as_attachment=False)
 
 @app.route('/api/jobs', methods=['GET'])
