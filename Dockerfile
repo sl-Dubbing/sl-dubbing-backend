@@ -1,20 +1,17 @@
-# استخدام نسخة بايثون خفيفة ومستقرة
 FROM python:3.10-slim
 
-# تحديث النظام وتثبيت ffmpeg بطريقة آمنة
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ffmpeg git && rm -rf /var/lib/apt/lists/*
 
-# تحديد مجلد العمل داخل السيرفر
 WORKDIR /app
 
-# نسخ جميع ملفات المشروع إلى السيرفر
-COPY . .
+# استنساخ محرك CosyVoice من المستودع الرسمي وتثبيت متطلباته الأساسية
+RUN git clone https://github.com/FunAudioLLM/CosyVoice.git
+ENV PYTHONPATH="/app/CosyVoice:$PYTHONPATH"
 
-# تثبيت مكتبات البايثون
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# فتح البورت
-EXPOSE 5000
+COPY . .
 
-# أمر تشغيل السيرفر
+EXPOSE 5000
 CMD ["python", "server.py"]
