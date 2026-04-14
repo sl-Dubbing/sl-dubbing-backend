@@ -12,3 +12,4 @@ gunicorn==22.0.0
 werkzeug==3.0.3
 modelscope==1.14.0
 torchaudio==2.2.2
+google-auth==2.29.0
