@@ -41,7 +41,6 @@ if not DATABASE_URL:
     logger.warning("⚠️ DATABASE_URL not set, using SQLite (dev only)")
     DATABASE_URL = 'sqlite:///sl_dubbing.db'
 
-# Fix for PostgreSQL URI format
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
@@ -61,14 +60,13 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
-    avatar = db.Column(db.String(10), default='👤')
-    credits = db.Column(db.Integer, default=50000)  # 50,000 characters free
-    password_hash = db.Column(db.String(255), nullable=True)  # For email signup
-    auth_method = db.Column(db.String(50), default='oauth')  # 'oauth' or 'email'
+    avatar = db.Column(db.String(500), default='👤')
+    credits = db.Column(db.Integer, default=50000) 
+    password_hash = db.Column(db.String(255), nullable=True)
+    auth_method = db.Column(db.String(50), default='oauth')
     last_login = db.Column(db.DateTime, default=datetime.utcnow)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     
-    # Relationships
     jobs = db.relationship('DubbingJob', backref='user', lazy=True, cascade='all, delete-orphan')
     credit_history = db.relationship('CreditTransaction', backref='user', lazy=True, cascade='all, delete-orphan')
     
@@ -95,9 +93,9 @@ class DubbingJob(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     
-    status = db.Column(db.String(20), default='pending')  # pending, processing, completed, failed
+    status = db.Column(db.String(20), default='pending')
     language = db.Column(db.String(10), nullable=False)
-    voice_mode = db.Column(db.String(50), nullable=False)  # 'xtts', 'cosy', 'gtts', 'source'
+    voice_mode = db.Column(db.String(50), nullable=False) 
     voice_id = db.Column(db.String(100), nullable=True)
     
     text_length = db.Column(db.Integer, default=0)
@@ -132,12 +130,12 @@ class CreditTransaction(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     
-    transaction_type = db.Column(db.String(20), nullable=False)  # 'usage', 'purchase', 'refund', 'bonus'
-    amount = db.Column(db.Integer, nullable=False)  # positive or negative
+    transaction_type = db.Column(db.String(20), nullable=False)
+    amount = db.Column(db.Integer, nullable=False)
     reason = db.Column(db.String(200), nullable=False)
     
-    job_id = db.Column(db.String(36), nullable=True)  # reference to DubbingJob if usage
-    payment_id = db.Column(db.String(100), nullable=True)  # reference to payment gateway
+    job_id = db.Column(db.String(36), nullable=True)
+    payment_id = db.Column(db.String(100), nullable=True)
     
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     
@@ -151,26 +149,6 @@ class CreditTransaction(db.Model):
         }
 
 # ============================================================================
-# AUTHENTICATION MIDDLEWARE
-# ============================================================================
-
-def require_auth(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        email = request.headers.get('X-User-Email')
-        if not email:
-            return jsonify({'error': 'Unauthorized'}), 401
-        
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-        
-        request.user = user
-        return f(*args, **kwargs)
-    
-    return decorated_function
-
-# ============================================================================
 # DIRECTORY SETUP
 # ============================================================================
 
@@ -178,7 +156,6 @@ AUDIO_DIR = Path('/tmp/sl_audio')
 VOICE_DIR = Path('/tmp/sl_voices')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
-
 VOICE_CACHE = {}
 
 # ============================================================================
@@ -190,7 +167,6 @@ COSY_MODEL = None
 ACTIVE_ENGINE = None
 
 def unload_engines():
-    """Unload AI Models to free VRAM and prevent OOM crashes"""
     global XTTS_MODEL, COSY_MODEL, ACTIVE_ENGINE
     if XTTS_MODEL is not None or COSY_MODEL is not None:
         logger.info("🧹 Unloading AI Models to free VRAM...")
@@ -213,7 +189,6 @@ def get_cosy():
             if '/app/CosyVoice' not in sys.path:
                 sys.path.append('/app/CosyVoice')
             from cosyvoice.cli.cosyvoice import CosyVoice
-            
             logger.info("⏳ Loading CosyVoice 3.0...")
             model_dir = snapshot_download('iic/CosyVoice-300M')
             COSY_MODEL = CosyVoice(model_dir)
@@ -241,127 +216,130 @@ def get_xtts():
             return None
     return XTTS_MODEL
 
-# Start XTTS by default on boot via background thread
 import threading
 init_thread = threading.Thread(target=get_xtts, daemon=True)
 init_thread.start()
 
 # ============================================================================
-# HELPER FUNCTIONS
+# API ROUTES
 # ============================================================================
 
-def deduct_credits(user, text_length):
-    """Deduct credits from user account"""
-    if user.credits < text_length:
-        return False, "رصيدك غير كافٍ"
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({
+        'status': 'ok',
+        'timestamp': datetime.utcnow().isoformat(),
+        'active_engine': ACTIVE_ENGINE,
+        'database': 'connected' if db.session.execute(db.text('SELECT 1')) else 'error'
+    })
+
+# ── مسار التحقق الرسمي من جوجل ──
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "497619073475-6vjelufub8gci231ettdhmk5pv0cdde3.apps.googleusercontent.com")
+
+@app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
+def google_auth():
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True}), 200
     
+    try:
+        data = request.get_json()
+        token = data.get('credential')
+        
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        
+        email = idinfo['email']
+        name = idinfo.get('name', email.split('@')[0])
+        picture = idinfo.get('picture', '👤')
+        
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            user = User(
+                email=email,
+                name=name,
+                avatar=picture,
+                auth_method='google',
+                credits=50000
+            )
+            db.session.add(user)
+            logger.info(f"✅ New real Google user created: {email}")
+        else:
+            user.last_login = datetime.utcnow()
+            user.avatar = picture 
+            logger.info(f"✅ Google user logged in: {email}")
+            
+        db.session.commit()
+        return jsonify({'success': True, 'user': user.to_dict()}), 200
+        
+    except ValueError as e:
+        logger.error(f"❌ Invalid Google Token: {e}")
+        return jsonify({'success': False, 'error': 'توكن غير صالح من جوجل'}), 401
+    except Exception as e:
+        logger.error(f"❌ Google Auth Error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/user', methods=['GET'])
+def get_user():
+    email = request.headers.get('X-User-Email')
+    if not email: return jsonify({'error': 'Unauthorized'}), 401
+    user = User.query.filter_by(email=email).first()
+    if not user: return jsonify({'error': 'User not found'}), 404
+    return jsonify({'success': True, 'user': user.to_dict(), 'credits': user.credits}), 200
+
+# باقي الدوال المساعدة للترجمة والتوليد (نفسها تماماً)
+def deduct_credits(user, text_length):
+    if user.credits < text_length: return False, "رصيدك غير كافٍ"
     user.credits -= text_length
-    transaction = CreditTransaction(
-        user_id=user.id,
-        transaction_type='usage',
-        amount=-text_length,
-        reason=f'Text generation: {text_length} characters'
-    )
+    transaction = CreditTransaction(user_id=user.id, transaction_type='usage', amount=-text_length, reason=f'Text generation: {text_length} characters')
     db.session.add(transaction)
     db.session.commit()
     return True, user.credits
 
 def fetch_voice_sample(voice_url, voice_id):
-    """Download and cache voice sample"""
-    if voice_id in VOICE_CACHE and Path(VOICE_CACHE[voice_id]).exists():
-        return VOICE_CACHE[voice_id]
-    
+    if voice_id in VOICE_CACHE and Path(VOICE_CACHE[voice_id]).exists(): return VOICE_CACHE[voice_id]
     try:
         import urllib.request
         local_path = VOICE_DIR / f"{voice_id}.wav"
         if not local_path.exists():
             tmp = VOICE_DIR / f"{voice_id}.tmp.mp3"
             urllib.request.urlretrieve(voice_url, str(tmp))
-            subprocess.run(
-                ['ffmpeg', '-y', '-i', str(tmp), '-ar', '22050', '-ac', '1', str(local_path)],
-                capture_output=True,
-                timeout=30
-            )
+            subprocess.run(['ffmpeg', '-y', '-i', str(tmp), '-ar', '22050', '-ac', '1', str(local_path)], capture_output=True, timeout=30)
             tmp.unlink(missing_ok=True)
-        
         if local_path.exists():
             VOICE_CACHE[voice_id] = str(local_path)
             return str(local_path)
-    except Exception as e:
-        logger.error(f"Voice download error: {e}")
-    
+    except Exception as e: logger.error(f"Voice download error: {e}")
     return None
 
-def extract_source_voice(media_url, job_id):
-    """Extract voice from YouTube URL"""
-    tmp_audio = AUDIO_DIR / f"raw_{job_id}.wav"
-    ref_audio = VOICE_DIR / f"ref_{job_id}.wav"
-    
-    try:
-        logger.info(f"⏳ Downloading YouTube audio: {media_url}")
-        subprocess.run(
-            ['yt-dlp', '-x', '--audio-format', 'wav', '-o', str(tmp_audio), media_url],
-            check=True,
-            timeout=120
-        )
-        
-        # Take first 15 seconds as voice sample
-        subprocess.run(
-            ['ffmpeg', '-y', '-i', str(tmp_audio), '-t', '15', '-ac', '1', '-ar', '22050', str(ref_audio)],
-            check=True,
-            timeout=30
-        )
-        
-        logger.info(f"✅ Voice extracted: {ref_audio}")
-        return str(ref_audio)
-    except Exception as e:
-        logger.error(f"Source extraction error: {e}")
-        return None
-
 def synthesize_cosy(text, voice_path, output_path):
-    """Generate speech using CosyVoice 3.0"""
     try:
         engine = get_cosy()
-        if engine is None:
-            return None, "CosyVoice not ready"
-            
+        if engine is None: return None, "CosyVoice not ready"
         from cosyvoice.utils.file_utils import load_wav
         import torchaudio
-        
         prompt_speech_16k = load_wav(voice_path, 16000)
         output = engine.inference_zero_shot(text, "نص العينة للمحاكاة", prompt_speech_16k)
         torchaudio.save(output_path, output['tts_speech'], 22050)
-        
-        if Path(output_path).exists():
-            return output_path, "cosyvoice"
+        if Path(output_path).exists(): return output_path, "cosyvoice"
         return None, "Empty output"
     except Exception as e:
         logger.error(f"CosyVoice error: {e}")
         return None, str(e)
 
 def synthesize_xtts(text, lang, voice_path, output_path):
-    """Generate speech using XTTS v2"""
     try:
         engine = get_xtts()
-        if engine is None:
-            return None, "XTTS not ready"
-        
-        engine.tts_to_file(
-            text=text,
-            speaker_wav=voice_path,
-            language=lang[:2],
-            file_path=output_path
-        )
-        
-        if Path(output_path).exists():
-            return output_path, "xtts"
+        if engine is None: return None, "XTTS not ready"
+        engine.tts_to_file(text=text, speaker_wav=voice_path, language=lang[:2], file_path=output_path)
+        if Path(output_path).exists(): return output_path, "xtts"
         return None, "Empty output"
     except Exception as e:
         logger.error(f"XTTS error: {e}")
         return None, str(e)
 
 def synthesize_gtts(text, lang, output_path):
-    """Generate speech using Google TTS"""
     try:
         from gtts import gTTS
         gTTS(text=text, lang=lang[:2]).save(output_path)
@@ -370,305 +348,77 @@ def synthesize_gtts(text, lang, output_path):
         logger.error(f"gTTS error: {e}")
         return None, str(e)
 
-def srt_time(s):
-    """Parse SRT timestamp"""
-    s = s.replace(",", ".")
-    p = s.split(":")
-    return int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
-
-def parse_srt(content):
-    """Parse SRT subtitle file"""
-    blocks, cur = [], None
-    for line in content.split("\n"):
-        line = line.strip()
-        if not line:
-            if cur:
-                blocks.append(cur)
-            cur = None
-        elif re.match(r"^\d+$", line):
-            if cur:
-                blocks.append(cur)
-            cur = {"i": int(line), "start": 0, "end": 0, "text": ""}
-        elif "-->" in line and cur:
-            p = line.split("-->")
-            cur["start"] = srt_time(p[0].strip())
-            cur["end"] = srt_time(p[1].strip())
-        elif cur:
-            cur["text"] += line + " "
-    
-    if cur:
-        blocks.append(cur)
-    return blocks
-
-# ============================================================================
-# API ROUTES
-# ============================================================================
-
-@app.route('/api/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'ok',
-        'timestamp': datetime.utcnow().isoformat(),
-        'active_engine': ACTIVE_ENGINE,
-        'database': 'connected' if db.session.execute(db.text('SELECT 1')) else 'error'
-    })
-
-@app.route('/api/sync-user', methods=['POST', 'OPTIONS'])
-def sync_user():
-    """Sync user from frontend"""
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
-    
-    try:
-        data = request.get_json()
-        email = data.get('email', '').lower().strip()
-        name = data.get('name', 'User')
-        avatar = data.get('avatar', '👤')
-        auth_method = data.get('method', 'oauth')
-        
-        if not email or '@' not in email:
-            return jsonify({'error': 'Invalid email'}), 400
-        
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            user = User(
-                email=email,
-                name=name,
-                avatar=avatar,
-                auth_method=auth_method,
-                credits=50000  # 50K free characters
-            )
-            db.session.add(user)
-            logger.info(f"✅ New user created: {email}")
-        else:
-            user.last_login = datetime.utcnow()
-            logger.info(f"✅ User logged in: {email}")
-        
-        db.session.commit()
-        
-        return jsonify({
-            'success': True,
-            'message': 'User synced',
-            'user': user.to_dict()
-        }), 200
-    
-    except Exception as e:
-        logger.error(f"Sync error: {e}")
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/user', methods=['GET'])
-def get_user():
-    """Get current user info"""
-    email = request.headers.get('X-User-Email')
-    if not email:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    return jsonify({
-        'success': True,
-        'user': user.to_dict(),
-        'credits': user.credits
-    }), 200
-
-@app.route('/api/credits/history', methods=['GET'])
-def get_credit_history():
-    """Get user's credit transaction history"""
-    email = request.headers.get('X-User-Email')
-    if not email:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    limit = request.args.get('limit', 50, type=int)
-    transactions = CreditTransaction.query.filter_by(user_id=user.id) \
-        .order_by(CreditTransaction.created_at.desc()) \
-        .limit(limit) \
-        .all()
-    
-    return jsonify({
-        'success': True,
-        'credits': user.credits,
-        'transactions': [t.to_dict() for t in transactions]
-    }), 200
-
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
 def dub():
-    """Process dubbing request"""
-    if request.method == 'OPTIONS':
-        return jsonify({'ok': True}), 200
-    
+    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
     try:
         data = request.get_json(force=True) or {}
-        
-        # Validate input
         email = data.get('email', '').lower().strip()
         text = data.get('text', '').strip()
         srt = data.get('srt', '').strip()
         lang = data.get('lang', 'ar')
-        voice_mode = data.get('voice_mode', 'muhamed')
+        voice_mode = data.get('voice_mode', 'gtts')
         voice_id = data.get('voice_id', '')
         voice_url = data.get('voice_url', '')
-        media_url = data.get('media_url', '').strip()
         
-        if not email or '@' not in email:
-            return jsonify({'success': False, 'error': 'Invalid email'}), 400
-        
-        # Get user
         user = User.query.filter_by(email=email).first()
-        if not user:
-            return jsonify({'success': False, 'error': 'User not found'}), 404
-        
-        # Validate text
-        if not text and not srt:
-            return jsonify({'success': False, 'error': 'Text or SRT required'}), 400
+        if not user: return jsonify({'success': False, 'error': 'User not found'}), 404
         
         text_length = len(text) if text else len(srt)
-        if text_length < 5:
-            return jsonify({'success': False, 'error': 'Text too short'}), 400
+        if text_length < 5: return jsonify({'success': False, 'error': 'Text too short'}), 400
         
-        if text_length > 50000:
-            text = text[:50000]
-            logger.warning(f"Text truncated to 50k chars for {email}")
+        if user.credits < text_length: return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
         
-        # Check credits
-        if user.credits < text_length:
-            return jsonify({
-                'success': False,
-                'error': 'رصيدك غير كافٍ',
-                'credits_needed': text_length,
-                'credits_available': user.credits
-            }), 402
-        
-        # Create job record
         job_id = str(uuid.uuid4())
-        job = DubbingJob(
-            id=job_id,
-            user_id=user.id,
-            language=lang,
-            voice_mode=voice_mode,
-            voice_id=voice_id,
-            text_length=text_length,
-            input_url=media_url or 'local_file'
-        )
+        job = DubbingJob(id=job_id, user_id=user.id, language=lang, voice_mode=voice_mode, text_length=text_length)
         db.session.add(job)
         
-        # Deduct credits
         success, result = deduct_credits(user, text_length)
-        if not success:
-            return jsonify({'success': False, 'error': result}), 402
+        if not success: return jsonify({'success': False, 'error': result}), 402
         
         job.credits_used = text_length
         job.status = 'processing'
         db.session.commit()
         
-        logger.info(f"🎯 Processing job {job_id} for {email} ({text_length} chars)")
-        
-        # Process audio
         t0 = time.time()
-        voice_path = None
-        
-        # Fetch or Extract Voice Sample
-        if voice_mode in ['source', 'xtts', 'cosy']:
-            if voice_mode == 'source' and media_url:
-                voice_path = extract_source_voice(media_url, job_id)
-            elif voice_url:
-                voice_path = fetch_voice_sample(voice_url, voice_id)
-        
+        voice_path = fetch_voice_sample(voice_url, voice_id) if voice_url else None
         output_path = str(AUDIO_DIR / f"dub_{job_id}.mp3")
         method = "none"
         
-        # Route to appropriate engine
         if voice_mode == 'cosy' and voice_path:
             output_path, method = synthesize_cosy(text, voice_path, output_path)
-        elif (voice_mode == 'xtts' or voice_mode == 'source') and voice_path:
+        elif voice_mode == 'xtts' and voice_path:
             output_path, method = synthesize_xtts(text, lang, voice_path, output_path)
         else:
             output_path, method = synthesize_gtts(text, lang, output_path)
         
         if not output_path or not Path(output_path).exists():
             job.status = 'failed'
-            job.error_message = 'Audio generation failed'
             db.session.commit()
             return jsonify({'success': False, 'error': 'فشل توليد الصوت'}), 500
         
-        # Generate public URL
         audio_url = f"https://{request.host}/api/file/{Path(output_path).name}"
         job.output_url = audio_url
         job.status = 'completed'
         job.processing_time = time.time() - t0
         db.session.commit()
         
-        logger.info(f"✅ Job {job_id} completed in {job.processing_time:.1f}s via {method}")
-        
-        return jsonify({
-            'success': True,
-            'job_id': job_id,
-            'audio_url': audio_url,
-            'method': method,
-            'processing_time': job.processing_time,
-            'remaining_credits': user.credits,
-            'message': 'الدبلجة جاهزة للتحميل!'
-        }), 200
+        return jsonify({'success': True, 'job_id': job_id, 'audio_url': audio_url, 'method': method, 'remaining_credits': user.credits}), 200
     
     except Exception as e:
-        logger.error(f"DUB error: {e}", exc_info=True)
+        logger.error(f"DUB error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/file/<filename>')
 def get_file(filename):
-    """Download processed audio file"""
     p = AUDIO_DIR / filename
-    if not p.exists():
-        return jsonify({'error': 'File not found'}), 404
-    
-    mime = 'audio/mpeg'  # MP3 by default
-    if str(p).endswith('.wav'):
-        mime = 'audio/wav'
-        
+    if not p.exists(): return jsonify({'error': 'File not found'}), 404
+    mime = 'audio/wav' if str(p).endswith('.wav') else 'audio/mpeg'
     return send_file(str(p), mimetype=mime, as_attachment=False)
-
-@app.route('/api/jobs', methods=['GET'])
-def get_jobs():
-    """Get user's dubbing jobs"""
-    email = request.headers.get('X-User-Email')
-    if not email:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    limit = request.args.get('limit', 20, type=int)
-    jobs = DubbingJob.query.filter_by(user_id=user.id) \
-        .order_by(DubbingJob.created_at.desc()) \
-        .limit(limit) \
-        .all()
-    
-    return jsonify({
-        'success': True,
-        'jobs': [j.to_dict() for j in jobs]
-    }), 200
-
-# ============================================================================
-# DATABASE INITIALIZATION
-# ============================================================================
 
 with app.app_context():
     db.create_all()
-    logger.info("✅ Database tables initialized")
-
-# ============================================================================
-# RUN SERVER
-# ============================================================================
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_ENV") == "development"
-    app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
+    app.run(host='0.0.0.0', port=port, threaded=True)
