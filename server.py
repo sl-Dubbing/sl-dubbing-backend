@@ -1,13 +1,18 @@
 # server.py — sl-Dubbing Backend (Enterprise Edition - SECURED & ENHANCED)
 import os, uuid, time, logging, subprocess, re, json, gc, sys
 from pathlib import Path
-from datetime import datetime
-from flask import Flask, request, jsonify, send_file
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from dotenv import load_dotenv
+
+# استيراد مكتبات الأمان الجديدة (JWT و Rate Limiter)
+import jwt
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 load_dotenv()
 logging.basicConfig(
@@ -17,15 +22,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# FLASK & CORS SETUP
+# FLASK, CORS & SECURITY SETUP
 # ============================================================================
 
 app = Flask(__name__)
+# تمكين إرسال الكوكيز (Credentials) في طلبات الـ CORS
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+
+# مفتاح التشفير السري الخاص بالـ JWT
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-key-sl-dubbing-2026')
+
+# تهيئة جدار الحماية (Rate Limiter)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["1000 per day", "100 per hour"],
+    storage_uri="memory://"
+)
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+    response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -109,20 +127,6 @@ class DubbingJob(db.Model):
     
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'status': self.status,
-            'language': self.language,
-            'voice_mode': self.voice_mode,
-            'text_length': self.text_length,
-            'credits_used': self.credits_used,
-            'output_url': self.output_url,
-            'error': self.error_message,
-            'processing_time': self.processing_time,
-            'created_at': self.created_at.isoformat()
-        }
 
 class CreditTransaction(db.Model):
     __tablename__ = 'credit_transactions'
@@ -138,15 +142,39 @@ class CreditTransaction(db.Model):
     payment_id = db.Column(db.String(100), nullable=True)
     
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'type': self.transaction_type,
-            'amount': self.amount,
-            'reason': self.reason,
-            'created_at': self.created_at.isoformat()
-        }
+
+# ============================================================================
+# JWT AUTHENTICATION MIDDLEWARE
+# ============================================================================
+
+def require_auth(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
+            
+        # استخراج التوكن المشفر من الـ Cookies المحمية
+        token = request.cookies.get('sl_auth_token')
+        
+        if not token:
+            return jsonify({'error': 'غير مصرح لك. يرجى تسجيل الدخول.'}), 401
+        
+        try:
+            # فك التشفير والتحقق من الجلسة
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            user = User.query.get(data['user_id'])
+            
+            if not user:
+                raise Exception("User not found")
+                
+            request.user = user
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'انتهت صلاحية الجلسة. يرجى تسجيل الدخول مجدداً.'}), 401
+        except Exception as e:
+            return jsonify({'error': 'جلسة غير صالحة.'}), 401
+            
+        return f(*args, **kwargs)
+    return decorated_function
 
 # ============================================================================
 # DIRECTORY SETUP
@@ -233,7 +261,7 @@ def health():
         'database': 'connected' if db.session.execute(db.text('SELECT 1')) else 'error'
     })
 
-# ── مسار التحقق الرسمي من جوجل ──
+# ── مسار التحقق الرسمي من جوجل وإصدار التوكن ──
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
@@ -271,7 +299,24 @@ def google_auth():
             logger.info(f"✅ Google user logged in: {email}")
             
         db.session.commit()
-        return jsonify({'success': True, 'user': user.to_dict()}), 200
+        
+        # إنشاء الهوية الرقمية (JWT) صالحة لمدة 7 أيام
+        auth_token = jwt.encode({
+            'user_id': user.id,
+            'exp': datetime.utcnow() + timedelta(days=7)
+        }, app.config['SECRET_KEY'], algorithm='HS256')
+        
+        # تغليف الرد لإرفاق الـ Cookie المحمية (HttpOnly)
+        resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
+        resp.set_cookie(
+            'sl_auth_token', 
+            auth_token, 
+            httponly=True, 
+            secure=True,          # تعمل عبر HTTPS فقط
+            samesite='None',      # للسماح بالاتصال من Github Pages إلى Railway
+            max_age=7*24*60*60
+        )
+        return resp
         
     except ValueError as e:
         logger.error(f"❌ Invalid Google Token: {e}")
@@ -280,15 +325,17 @@ def google_auth():
         logger.error(f"❌ Google Auth Error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/user', methods=['GET'])
+@app.route('/api/user', methods=['GET', 'OPTIONS'])
+@require_auth # تمت حماية هذا المسار
 def get_user():
-    email = request.headers.get('X-User-Email')
-    if not email: return jsonify({'error': 'Unauthorized'}), 401
-    user = User.query.filter_by(email=email).first()
-    if not user: return jsonify({'error': 'User not found'}), 404
+    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    user = request.user
     return jsonify({'success': True, 'user': user.to_dict(), 'credits': user.credits}), 200
 
-# باقي الدوال المساعدة للترجمة والتوليد (نفسها تماماً)
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 def deduct_credits(user, text_length):
     if user.credits < text_length: return False, "رصيدك غير كافٍ"
     user.credits -= text_length
@@ -348,7 +395,12 @@ def synthesize_gtts(text, lang, output_path):
         logger.error(f"gTTS error: {e}")
         return None, str(e)
 
+# ============================================================================
+# MAIN DUBBING ROUTE
+# ============================================================================
+
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
+@limiter.limit("5 per minute") # حماية من طلبات التوليد العشوائية والمفرطة (Brute Force)
 def dub():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
     try:
