@@ -333,6 +333,12 @@ def get_job(job_id):
         'updated_at': job.updated_at.isoformat() if job.updated_at else None
     }), 200
 
+@app.route('/api/user', methods=['GET'])
+@require_auth
+def get_current_user():
+    u = request.user
+    return jsonify({'success': True, 'user': u.to_dict()}), 200
+
 @app.route('/api/file/<filename>')
 @limiter.limit("100 per hour")
 def get_file(filename):
