@@ -1,0 +1,48 @@
+# models.py
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+import uuid
+
+db = SQLAlchemy()
+
+def gen_uuid():
+    return str(uuid.uuid4())
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    avatar = db.Column(db.String(500), default='👤')
+    credits = db.Column(db.Integer, default=50000)
+    password_hash = db.Column(db.String(255), nullable=True)
+    auth_method = db.Column(db.String(50), default='oauth')
+    last_login = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {'id': self.id, 'email': self.email, 'name': self.name, 'avatar': self.avatar, 'credits': self.credits, 'auth_method': self.auth_method}
+
+class DubbingJob(db.Model):
+    __tablename__ = 'dubbing_jobs'
+    id = db.Column(db.String(36), primary_key=True, default=gen_uuid)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    status = db.Column(db.String(20), default='pending', index=True)  # pending, processing, completed, failed
+    language = db.Column(db.String(10), nullable=False)
+    voice_mode = db.Column(db.String(50), nullable=False)
+    text_length = db.Column(db.Integer, default=0)
+    credits_used = db.Column(db.Integer, default=0)
+    output_url = db.Column(db.String(1000), nullable=True)
+    processing_time = db.Column(db.Float, nullable=True)
+    method = db.Column(db.String(50), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class CreditTransaction(db.Model):
+    __tablename__ = 'credit_transactions'
+    id = db.Column(db.String(36), primary_key=True, default=gen_uuid)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    transaction_type = db.Column(db.String(20), nullable=False)  # usage, refund, topup
+    amount = db.Column(db.Integer, nullable=False)
+    reason = db.Column(db.String(200), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
