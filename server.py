@@ -12,7 +12,6 @@ import jwt
 from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from werkzeug.security import generate_password_hash, check_password_hash
 
 # Optional Google libs
 try:
@@ -337,6 +336,7 @@ def get_job(job_id):
 @app.route('/api/file/<filename>')
 @limiter.limit("100 per hour")
 def get_file(filename):
+    # Accept mp3 filenames produced by worker (dub_*.mp3 or tts_*.mp3)
     if not filename.startswith('dub_') and not filename.startswith('tts_'):
         return jsonify({'error': 'Invalid file request'}), 403
     p = AUDIO_DIR / filename
@@ -345,7 +345,8 @@ def get_file(filename):
             return jsonify({'error': 'Security violation: Path traversal blocked'}), 403
     except Exception:
         return jsonify({'error': 'Security violation: Path traversal blocked'}), 403
-    return send_file(str(p), mimetype='audio/wav', as_attachment=False) if p.exists() else (jsonify({'error': 'File not found'}), 404)
+    # Serve MP3 files
+    return send_file(str(p), mimetype='audio/mpeg', as_attachment=False) if p.exists() else (jsonify({'error': 'File not found'}), 404)
 
 @app.route('/api/health', methods=['GET'])
 def health():
