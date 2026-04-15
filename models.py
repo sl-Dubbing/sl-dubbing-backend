@@ -1,12 +1,10 @@
 # models.py
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-import uuid
+from uuid import uuid4
 
 db = SQLAlchemy()
-
-def gen_uuid():
-    return str(uuid.uuid4())
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -20,12 +18,32 @@ class User(db.Model):
     last_login = db.Column(db.DateTime, default=datetime.utcnow)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
+    # Relationships
+    jobs = db.relationship('DubbingJob', backref='user', lazy=True, cascade='all, delete-orphan')
+    transactions = db.relationship('CreditTransaction', backref='user', lazy=True, cascade='all, delete-orphan')
+
+    # Password helpers
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        if not self.password_hash:
+            return False
+        return check_password_hash(self.password_hash, password)
+
     def to_dict(self):
-        return {'id': self.id, 'email': self.email, 'name': self.name, 'avatar': self.avatar, 'credits': self.credits, 'auth_method': self.auth_method}
+        return {
+            'id': self.id,
+            'email': self.email,
+            'name': self.name,
+            'avatar': self.avatar,
+            'credits': self.credits,
+            'auth_method': self.auth_method
+        }
 
 class DubbingJob(db.Model):
     __tablename__ = 'dubbing_jobs'
-    id = db.Column(db.String(36), primary_key=True, default=gen_uuid)
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     status = db.Column(db.String(20), default='pending', index=True)  # pending, processing, completed, failed
     language = db.Column(db.String(10), nullable=False)
@@ -40,7 +58,7 @@ class DubbingJob(db.Model):
 
 class CreditTransaction(db.Model):
     __tablename__ = 'credit_transactions'
-    id = db.Column(db.String(36), primary_key=True, default=gen_uuid)
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     transaction_type = db.Column(db.String(20), nullable=False)  # usage, refund, topup
     amount = db.Column(db.Integer, nullable=False)
