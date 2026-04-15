@@ -1,67 +1,26 @@
 *** Begin Patch
-*** Update File: models.py
+*** Update File: server.py
 @@
- from flask_sqlalchemy import SQLAlchemy
- from werkzeug.security import generate_password_hash, check_password_hash
- from datetime import datetime
- from uuid import uuid4
- 
- db = SQLAlchemy()
- 
- class User(db.Model):
+ @app.route('/api/job/<job_id>', methods=['GET'])
+ @require_auth
+ def get_job(job_id):
 @@
-     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
- 
-     # Relationships
-     jobs = db.relationship('DubbingJob', backref='user', lazy=True, cascade='all, delete-orphan')
-     transactions = db.relationship('CreditTransaction', backref='user', lazy=True, cascade='all, delete-orphan')
- 
-     # Password helpers
-     def set_password(self, password):
--        self.password_hash = generate_password_hash(password)
-+        self.password_hash = generate_password_hash(password)
- 
-     def check_password(self, password):
--        if not self.password_hash:
--            return False
--        return check_password_hash(self.password_hash, password)
-+        if not self.password_hash:
-+            return False
-+        return check_password_hash(self.password_hash, password)
- 
-     def to_dict(self):
-         return {
-             'id': self.id,
-             'email': self.email,
-             'name': self.name,
-             'avatar': self.avatar,
-             'credits': self.credits,
-             'auth_method': self.auth_method
-         }
- 
- class DubbingJob(db.Model):
-     __tablename__ = 'dubbing_jobs'
--    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
-+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
-     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-     status = db.Column(db.String(20), default='pending', index=True)  # pending, processing, completed, failed
-     language = db.Column(db.String(10), nullable=False)
-     voice_mode = db.Column(db.String(50), nullable=False)
-     text_length = db.Column(db.Integer, default=0)
-     credits_used = db.Column(db.Integer, default=0)
-     output_url = db.Column(db.String(1000), nullable=True)
-     processing_time = db.Column(db.Float, nullable=True)
-     method = db.Column(db.String(50), nullable=True)
-     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
- 
- class CreditTransaction(db.Model):
-     __tablename__ = 'credit_transactions'
--    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
-+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
-     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-     transaction_type = db.Column(db.String(20), nullable=False)  # usage, refund, topup
-     amount = db.Column(db.Integer, nullable=False)
-     reason = db.Column(db.String(200), nullable=False)
-     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+     return jsonify({
+         'success': True,
+         'job_id': job.id,
+         'status': job.status,
+         'audio_url': audio_url,
+         'method': job.method,
+         'processing_time': job.processing_time,
+         'credits_used': job.credits_used,
+         'remaining_credits': remaining_credits,
+         'created_at': job.created_at.isoformat() if job.created_at else None,
+         'updated_at': job.updated_at.isoformat() if job.updated_at else None
+     }), 200
++
++@app.route('/api/user', methods=['GET'])
++@require_auth
++def get_current_user():
++    u = request.user
++    return jsonify({'success': True, 'user': u.to_dict()}), 200
 *** End Patch
