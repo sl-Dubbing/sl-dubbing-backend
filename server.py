@@ -13,6 +13,15 @@ import jwt
 from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# Google auth libs (optional; used in google_auth route)
+try:
+    from google.oauth2 import id_token
+    from google.auth.transport import requests as google_requests
+    GOOGLE_LIBS_AVAILABLE = True
+except Exception:
+    GOOGLE_LIBS_AVAILABLE = False
 
 # Load env
 load_dotenv()
@@ -57,7 +66,7 @@ def get_celery():
     import tasks
     return tasks.celery_app, tasks.process_tts
 
-# Helpers
+# ----------------- Helpers -----------------
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -90,6 +99,33 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def generate_auth_response(user, is_new=False):
+    token = jwt.encode({
+        'user_id': user.id,
+        'sub': user.email,
+        'iat': datetime.utcnow(),
+        'exp': datetime.utcnow() + timedelta(hours=2)
+    }, app.config['SECRET_KEY'], algorithm='HS256')
+    resp = make_response(jsonify({'success': True, 'user': user.to_dict(), 'is_new': is_new}))
+    resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=2*60*60)
+    return resp
+
+def sanitize_url(url):
+    if not url:
+        return '👤'
+    parsed = None
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+    except Exception:
+        return '👤'
+    if parsed.scheme != 'https':
+        return '👤'
+    trusted_domains = ['googleusercontent.com']
+    if not any(domain in parsed.netloc for domain in trusted_domains):
+        return '👤'
+    return url
+
 def is_valid_srt(srt_text):
     if not srt_text:
         return False
@@ -98,7 +134,110 @@ def is_valid_srt(srt_text):
     timestamp_pattern = r'\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}'
     return re.search(timestamp_pattern, srt_text) is not None
 
-# Routes
+# ----------------- Auth Routes -----------------
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+
+@app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def google_auth():
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True}), 200
+    if not GOOGLE_LIBS_AVAILABLE or not GOOGLE_CLIENT_ID:
+        logger.error("Google auth libs or client ID not configured")
+        return jsonify({'success': False, 'error': 'Google auth not available'}), 500
+    try:
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            return jsonify({'success': False, 'error': 'Invalid request JSON'}), 400
+        token = data.get('credential')
+        if not token:
+            return jsonify({'success': False, 'error': 'No token provided'}), 400
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        if not idinfo.get('email_verified'):
+            return jsonify({'success': False, 'error': 'Email not verified by Google'}), 401
+        email = idinfo['email']
+        name = idinfo.get('name', email.split('@')[0])[:50]
+        picture = sanitize_url(idinfo.get('picture', '👤'))
+        user = User.query.filter_by(email=email).first()
+        is_new = False
+        if not user:
+            user = User(email=email, name=name, avatar=picture, auth_method='google', credits=50000)
+            db.session.add(user)
+            is_new = True
+        else:
+            user.last_login = datetime.utcnow()
+            user.avatar = picture
+        db.session.commit()
+        logger.info(f"Successful Google login: user_id={user.id}")
+        return generate_auth_response(user, is_new)
+    except ValueError as e:
+        logger.error(f"Invalid Google token: {e}")
+        return jsonify({'success': False, 'error': 'Invalid token'}), 401
+    except Exception as e:
+        logger.error(f"Google Auth error: {e}")
+        return jsonify({'success': False, 'error': 'Authentication failed'}), 500
+
+@app.route('/api/auth/register', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def register():
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True}), 200
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({'success': False, 'error': 'Invalid JSON'}), 400
+    email = (data.get('email') or '').strip().lower()
+    password = data.get('password') or ''
+    if not email or not password:
+        return jsonify({'success': False, 'error': 'Email and password required'}), 400
+    if len(email) > 120:
+        return jsonify({'success': False, 'error': 'Email too long'}), 400
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        return jsonify({'success': False, 'error': 'Invalid email format'}), 400
+    if len(password) < 8:
+        return jsonify({'success': False, 'error': 'Password must be at least 8 characters'}), 400
+    if not any(c.isalpha() for c in password) or not any(c.isdigit() for c in password):
+        return jsonify({'success': False, 'error': 'Password must contain letters and numbers'}), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify({'success': False, 'error': 'Email already registered'}), 400
+    user = User(email=email, name=email.split('@')[0][:50], auth_method='email', credits=50000)
+    user.password_hash = generate_password_hash(password)
+    db.session.add(user)
+    db.session.commit()
+    logger.info(f"Successful registration: user_id={user.id}")
+    return generate_auth_response(user, True)
+
+@app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def login():
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True}), 200
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({'success': False, 'error': 'Invalid JSON'}), 400
+    email = (data.get('email') or '').strip().lower()
+    password = data.get('password') or ''
+    if not email or not password:
+        return jsonify({'success': False, 'error': 'Email and password required'}), 400
+    user = User.query.filter_by(email=email).first()
+    ip = request.remote_addr or request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or 'unknown'
+    if not user or not user.password_hash or not check_password_hash(user.password_hash, password):
+        logger.warning(f"Failed login attempt from IP: {ip}")
+        return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
+    user.last_login = datetime.utcnow()
+    db.session.commit()
+    logger.info(f"Successful login: user_id={user.id}")
+    return generate_auth_response(user)
+
+@app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
+def logout():
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True}), 200
+    resp = make_response(jsonify({'success': True}))
+    resp.set_cookie('sl_auth_token', '', expires=0, httponly=True, secure=True, samesite='None')
+    return resp
+
+# ----------------- Main endpoints (enqueue + job status) -----------------
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
 @require_auth
 @limiter.limit("5 per minute")
@@ -183,7 +322,6 @@ def get_job(job_id):
     if not job or job.user_id != request.user.id:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
 
-    # Determine audio_url handling: if local file path (file://) convert to downloadable URL via /api/file/<filename>
     audio_url = job.output_url
     if audio_url and audio_url.startswith('file://'):
         local_path = audio_url[len('file://'):]
