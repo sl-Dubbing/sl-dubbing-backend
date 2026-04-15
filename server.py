@@ -1,8 +1,12 @@
 # server.py
-import os, uuid, time, logging, re
+import os
+import uuid
+import time
+import logging
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 import jwt
@@ -23,6 +27,8 @@ ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500', 'htt
 ALLOWED_LANGS = ['ar', 'en', 'es', 'fr', 'de', 'it', 'pt', 'tr', 'ru', 'zh', 'ja', 'ko', 'yue', 'hi', 'ur']
 ALLOWED_VOICE_MODES = ['gtts', 'xtts', 'cosy', 'source']
 MAX_TEXT_LENGTH = 10000
+AUDIO_DIR = Path('/tmp/sl_audio')
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # Flask app
 app = Flask(__name__)
@@ -46,10 +52,8 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day", "
 from models import db, User, DubbingJob, CreditTransaction
 db.init_app(app)
 
-# Import Celery task entrypoint (tasks.py defines celery_app and process_tts)
-# We import lazily inside function to avoid circular import at module import time
+# Lazy import of tasks to avoid circular import at module load
 def get_celery():
-    # tasks.py must be in same package; import here to avoid circular import issues
     import tasks
     return tasks.celery_app, tasks.process_tts
 
@@ -57,9 +61,11 @@ def get_celery():
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if request.method == 'OPTIONS': return f(*args, **kwargs)
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
         token = request.cookies.get('sl_auth_token')
-        if not token: return jsonify({'error': 'Unauthorized'}), 401
+        if not token:
+            return jsonify({'error': 'Unauthorized'}), 401
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
             user_id = data.get('user_id')
@@ -85,8 +91,10 @@ def require_auth(f):
     return decorated_function
 
 def is_valid_srt(srt_text):
-    if not srt_text: return False
-    if srt_text.count('-->') < 1: return False
+    if not srt_text:
+        return False
+    if srt_text.count('-->') < 1:
+        return False
     timestamp_pattern = r'\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}'
     return re.search(timestamp_pattern, srt_text) is not None
 
@@ -95,7 +103,9 @@ def is_valid_srt(srt_text):
 @require_auth
 @limiter.limit("5 per minute")
 def dub():
-    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True}), 200
+
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get('text') or '').strip()
     srt = (data.get('srt') or '').strip()
@@ -122,7 +132,6 @@ def dub():
         return jsonify({'success': False, 'error': f'Text exceeds maximum allowed length ({MAX_TEXT_LENGTH})'}), 400
 
     user = request.user
-    # Reserve credits and create job
     if user.credits < text_length:
         return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
 
@@ -133,12 +142,11 @@ def dub():
         job = DubbingJob(id=job_id, user_id=user.id, language=lang, voice_mode=voice_mode, text_length=text_length, credits_used=text_length, status='processing')
         db.session.add(job)
         db.session.commit()
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        logger.error(f"DB error reserving credits/job: {type(e).__name__}")
+        logger.error("DB error reserving credits/job")
         return jsonify({'success': False, 'error': 'Internal error reserving job'}), 500
 
-    # Enqueue Celery task
     try:
         celery_app, process_tts = get_celery()
         payload = {
@@ -153,8 +161,7 @@ def dub():
         }
         task = process_tts.delay(payload)
         logger.info(f"Enqueued TTS task: job_id={job_id} task_id={task.id}")
-    except Exception as e:
-        # rollback reservation if enqueue fails
+    except Exception:
         try:
             job = DubbingJob.query.get(job_id)
             if job:
@@ -164,7 +171,7 @@ def dub():
             db.session.commit()
         except Exception:
             db.session.rollback()
-        logger.error(f"Failed to enqueue task: {type(e).__name__}")
+        logger.error("Failed to enqueue task")
         return jsonify({'success': False, 'error': 'Failed to start background processing'}), 500
 
     return jsonify({'success': True, 'job_id': job_id, 'task_id': task.id, 'status': 'processing', 'remaining_credits': user.credits}), 200
@@ -175,23 +182,49 @@ def get_job(job_id):
     job = DubbingJob.query.get(job_id)
     if not job or job.user_id != request.user.id:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    # Determine audio_url handling: if local file path (file://) convert to downloadable URL via /api/file/<filename>
+    audio_url = job.output_url
+    if audio_url and audio_url.startswith('file://'):
+        local_path = audio_url[len('file://'):]
+        p = Path(local_path)
+        if p.exists():
+            audio_url = f"https://{request.host}/api/file/{p.name}"
+        else:
+            audio_url = None
+
+    remaining_credits = request.user.credits
+
     return jsonify({
         'success': True,
         'job_id': job.id,
         'status': job.status,
-        'audio_url': job.output_url,
+        'audio_url': audio_url,
         'method': job.method,
         'processing_time': job.processing_time,
         'credits_used': job.credits_used,
-        'created_at': job.created_at.isoformat()
+        'remaining_credits': remaining_credits,
+        'created_at': job.created_at.isoformat() if job.created_at else None,
+        'updated_at': job.updated_at.isoformat() if job.updated_at else None
     }), 200
 
-# Health
+@app.route('/api/file/<filename>')
+@limiter.limit("100 per hour")
+def get_file(filename):
+    if not filename.startswith('dub_') and not filename.startswith('tts_'):
+        return jsonify({'error': 'Invalid file request'}), 403
+    p = AUDIO_DIR / filename
+    try:
+        if not str(p.resolve()).startswith(str(AUDIO_DIR.resolve())):
+            return jsonify({'error': 'Security violation: Path traversal blocked'}), 403
+    except Exception:
+        return jsonify({'error': 'Security violation: Path traversal blocked'}), 403
+    return send_file(str(p), mimetype='audio/wav', as_attachment=False) if p.exists() else (jsonify({'error': 'File not found'}), 404)
+
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok', 'timestamp': datetime.utcnow().isoformat()}), 200
 
-# Create DB tables if run directly
 with app.app_context():
     db.create_all()
 
