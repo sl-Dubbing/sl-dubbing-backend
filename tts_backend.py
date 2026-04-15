@@ -45,16 +45,15 @@ def load_cosy():
     global cosy_model
     if cosy_model is None:
         try:
-            # استبدل السطور التالية بدعوة CosyVoice الحقيقية حسب الحزمة الرسمية
-            # مثال افتراضي: from cosyvoice import CosyVoice
-            # cosy_model = CosyVoice(model="cosyvoice-3.0", device=device)
-            from cosyvoice import CosyVoice  # <-- تأكد من اسم الحزمة الحقيقي
-            device = "cuda" if CosyVoice.is_cuda_available() else "cpu"
+            # حاول استيراد مكتبة CosyVoice — استبدل هذا إذا كان اسم الحزمة مختلفًا
+            import cosyvoice
+            # افتراض: cosyvoice.CosyVoice(...) — عدّل حسب التوثيق الحقيقي
+            device = "cuda" if getattr(cosyvoice, "is_cuda_available", lambda: False)() else "cpu"
             logger.info("Loading CosyVoice 3.0 on %s", device)
-            cosy_model = CosyVoice(model="cosyvoice-3.0", device=device)
+            cosy_model = cosyvoice.CosyVoice(model="cosyvoice-3.0", device=device)
             logger.info("CosyVoice loaded")
         except Exception:
-            logger.exception("Failed to load CosyVoice")
+            logger.exception("Failed to load CosyVoice (package may be missing or API differs)")
             cosy_model = None
     return cosy_model
 
@@ -69,12 +68,12 @@ def synthesize_text(text: str, lang: str='ar', voice_mode: str='xtts', voice_id:
     try:
         tmp_wav = _temp_path(suffix=".wav")
         tmp_mp3 = tmp_wav[:-4] + ".mp3"
+
         # XTTS path
         if voice_mode == 'xtts':
             model = load_xtts()
             if model:
                 try:
-                    # If voice_url provided, pass as speaker_wav; else model default
                     speaker = voice_url if voice_url else None
                     model.tts_to_file(text=text, speaker_wav=speaker, language=lang, file_path=tmp_wav, split_sentences=True, verbose=False)
                     if convert_wav_to_mp3(tmp_wav, tmp_mp3):
@@ -82,21 +81,24 @@ def synthesize_text(text: str, lang: str='ar', voice_mode: str='xtts', voice_id:
                     return tmp_wav
                 except Exception:
                     logger.exception("XTTS generation failed, falling back")
+
         # CosyVoice path
         if voice_mode == 'cosy':
             model = load_cosy()
             if model:
                 try:
-                    # استبدل السطر التالي بدعوة CosyVoice الحقيقية
+                    # استبدل السطر التالي بدعوة CosyVoice الحقيقية حسب التوثيق
+                    # مثال افتراضي:
+                    # model.synthesize_to_file(text=text, speaker=voice_id or None, out_path=tmp_wav, lang=lang)
                     model.synthesize_to_file(text=text, speaker=voice_id or None, out_path=tmp_wav, lang=lang)
                     if convert_wav_to_mp3(tmp_wav, tmp_mp3):
                         return tmp_mp3
                     return tmp_wav
                 except Exception:
                     logger.exception("CosyVoice generation failed, falling back")
-        # source cloning: try XTTS or cosy if sample provided
+
+        # source cloning: try xtts then cosy
         if voice_mode == 'source' and voice_url:
-            # try xtts first
             model = load_xtts()
             if model:
                 try:
@@ -109,12 +111,14 @@ def synthesize_text(text: str, lang: str='ar', voice_mode: str='xtts', voice_id:
             model = load_cosy()
             if model:
                 try:
+                    # مثال افتراضي: model.synthesize_to_file(..., sample_wav=voice_url, ...)
                     model.synthesize_to_file(text=text, speaker=voice_id or None, sample_wav=voice_url, out_path=tmp_wav, lang=lang)
                     if convert_wav_to_mp3(tmp_wav, tmp_mp3):
                         return tmp_mp3
                     return tmp_wav
                 except Exception:
                     logger.exception("Source cloning via CosyVoice failed")
+
         # Fallback to gTTS
         try:
             from gtts import gTTS
