@@ -1,7 +1,6 @@
 # server.py
 import os
 import uuid
-import time
 import logging
 import re
 from pathlib import Path
@@ -15,7 +14,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# Google auth libs (optional; used in google_auth route)
+# Optional Google libs
 try:
     from google.oauth2 import id_token
     from google.auth.transport import requests as google_requests
@@ -23,15 +22,12 @@ try:
 except Exception:
     GOOGLE_LIBS_AVAILABLE = False
 
-# Load env
 load_dotenv()
 
-# Logging
 DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# Config constants
 ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500', 'http://127.0.0.1:5500']
 ALLOWED_LANGS = ['ar', 'en', 'es', 'fr', 'de', 'it', 'pt', 'tr', 'ru', 'zh', 'ja', 'ko', 'yue', 'hi', 'ur']
 ALLOWED_VOICE_MODES = ['gtts', 'xtts', 'cosy', 'source']
@@ -39,7 +35,6 @@ MAX_TEXT_LENGTH = 10000
 AUDIO_DIR = Path('/tmp/sl_audio')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-# Flask app
 app = Flask(__name__)
 app.config['DEBUG'] = DEBUG
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY')
@@ -57,16 +52,13 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day", "100 per hour"], storage_uri="memory://")
 
-# Import shared models and init db
 from models import db, User, DubbingJob, CreditTransaction
 db.init_app(app)
 
-# Lazy import of tasks to avoid circular import at module load
 def get_celery():
     import tasks
     return tasks.celery_app, tasks.process_tts
 
-# ----------------- Helpers -----------------
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -90,11 +82,11 @@ def require_auth(f):
             ip = request.remote_addr or request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or 'unknown'
             logger.warning(f"Invalid token attempt from IP: {ip}")
             return jsonify({'error': 'Session expired or invalid.'}), 401
-        except Exception as e:
+        except Exception:
             if app.config.get('DEBUG'):
                 logger.exception("Unexpected auth error")
             else:
-                logger.error(f"Unexpected auth error: {type(e).__name__}")
+                logger.error("Unexpected auth error")
             return jsonify({'error': 'Session expired or invalid.'}), 401
         return f(*args, **kwargs)
     return decorated_function
@@ -113,7 +105,6 @@ def generate_auth_response(user, is_new=False):
 def sanitize_url(url):
     if not url:
         return '👤'
-    parsed = None
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -134,7 +125,6 @@ def is_valid_srt(srt_text):
     timestamp_pattern = r'\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}'
     return re.search(timestamp_pattern, srt_text) is not None
 
-# ----------------- Auth Routes -----------------
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 
 @app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
@@ -201,7 +191,7 @@ def register():
     if User.query.filter_by(email=email).first():
         return jsonify({'success': False, 'error': 'Email already registered'}), 400
     user = User(email=email, name=email.split('@')[0][:50], auth_method='email', credits=50000)
-    user.password_hash = generate_password_hash(password)
+    user.set_password(password)
     db.session.add(user)
     db.session.commit()
     logger.info(f"Successful registration: user_id={user.id}")
@@ -221,7 +211,7 @@ def login():
         return jsonify({'success': False, 'error': 'Email and password required'}), 400
     user = User.query.filter_by(email=email).first()
     ip = request.remote_addr or request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or 'unknown'
-    if not user or not user.password_hash or not check_password_hash(user.password_hash, password):
+    if not user or not user.check_password(password):
         logger.warning(f"Failed login attempt from IP: {ip}")
         return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
     user.last_login = datetime.utcnow()
@@ -237,14 +227,12 @@ def logout():
     resp.set_cookie('sl_auth_token', '', expires=0, httponly=True, secure=True, samesite='None')
     return resp
 
-# ----------------- Main endpoints (enqueue + job status) -----------------
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
 @require_auth
 @limiter.limit("5 per minute")
 def dub():
     if request.method == 'OPTIONS':
         return jsonify({'ok': True}), 200
-
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get('text') or '').strip()
     srt = (data.get('srt') or '').strip()
