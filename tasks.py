@@ -2,22 +2,17 @@
 import os
 import time
 import logging
-import traceback
 import tempfile
 from pathlib import Path
 from celery import Celery
 from dotenv import load_dotenv
-import cloudinary
-import cloudinary.uploader
 
-# Load env
 load_dotenv()
 
 DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# Celery / Redis
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 celery_app = Celery('sl_dubbing_tasks', broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.update(
@@ -33,16 +28,23 @@ celery_app.conf.update(
     result_expires=3600,
 )
 
-# Cloudinary
-CLOUDINARY_NAME = os.getenv('CLOUDINARY_NAME')
-CLOUDINARY_API_KEY = os.getenv('CLOUDINARY_API_KEY')
-CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET')
-if CLOUDINARY_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
-    cloudinary.config(cloud_name=CLOUDINARY_NAME, api_key=CLOUDINARY_API_KEY, api_secret=CLOUDINARY_API_SECRET, secure=True)
-else:
-    logger.warning("Cloudinary credentials not fully set; uploads will fallback to local storage.")
+# Cloudinary optional import
+try:
+    import cloudinary
+    import cloudinary.uploader
+    CLOUDINARY_AVAILABLE = True
+    CLOUDINARY_NAME = os.getenv('CLOUDINARY_NAME')
+    CLOUDINARY_API_KEY = os.getenv('CLOUDINARY_API_KEY')
+    CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET')
+    if CLOUDINARY_AVAILABLE and CLOUDINARY_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+        cloudinary.config(cloud_name=CLOUDINARY_NAME, api_key=CLOUDINARY_API_KEY, api_secret=CLOUDINARY_API_SECRET, secure=True)
+    else:
+        CLOUDINARY_AVAILABLE = False
+        logger.warning("Cloudinary credentials missing; will fallback to local storage.")
+except Exception:
+    CLOUDINARY_AVAILABLE = False
+    logger.warning("Cloudinary library not installed; uploads will fallback to local storage.")
 
-# Import models and DB; create a minimal Flask app context to bind SQLAlchemy
 from flask import Flask
 from models import db, User, DubbingJob, CreditTransaction
 
@@ -56,7 +58,7 @@ flask_app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 flask_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(flask_app)
 
-# Load TTS model in worker
+# Load TTS model in worker only
 tts = None
 try:
     import torch
@@ -71,7 +73,6 @@ except Exception:
         logger.exception("TTS load exception")
     tts = None
 
-# Helpers
 def safe_temp_wav(prefix="tts_", suffix=".wav"):
     fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
     os.close(fd)
@@ -92,7 +93,6 @@ def cloudinary_upload_with_retries(local_path, public_id, folder="sl-dubbing/aud
             time.sleep(wait)
     raise last_exc
 
-# Task
 @celery_app.task(name='tasks.process_tts', bind=True, max_retries=2, default_retry_delay=60)
 def process_tts(self, payload):
     job_id = payload.get('job_id')
@@ -127,11 +127,15 @@ def process_tts(self, payload):
             if not text or len(text) < 5:
                 raise ValueError("Text too short")
 
-            tmp_output = safe_temp_wav(prefix=f"tts_{job_id}_", suffix=".wav")
-            logger.info(f"[{job_id}] Generating audio to {tmp_output}")
+            # Generate WAV first, then convert to MP3 for consistent delivery
+            tmp_wav = safe_temp_wav(prefix=f"tts_{job_id}_", suffix=".wav")
+            tmp_mp3 = tmp_wav[:-4] + ".mp3"
+            tmp_output = tmp_mp3  # final expected path
+            logger.info(f"[{job_id}] Generating audio to (wav) {tmp_wav} then convert to mp3 {tmp_mp3}")
 
             method = "gtts"
-            output_path = tmp_output
+            output_wav = tmp_wav
+            output_path = tmp_mp3
 
             # Attempt cloning with TTS model if requested and model available
             if voice_mode in ['xtts', 'cosy'] and voice_url and voice_id and tts:
@@ -141,7 +145,7 @@ def process_tts(self, payload):
                     sample_tmp = safe_temp_wav(prefix=f"sample_{voice_id}_", suffix=".wav")
                     with urllib.request.urlopen(voice_url, timeout=30) as resp, open(sample_tmp, 'wb') as out_f:
                         out_f.write(resp.read())
-                    tts.tts_to_file(text=text, speaker_wav=sample_tmp, language=lang, file_path=output_path, split_sentences=True, verbose=False)
+                    tts.tts_to_file(text=text, speaker_wav=sample_tmp, language=lang, file_path=output_wav, split_sentences=True, verbose=False)
                     method = "xtts" if voice_mode == 'xtts' else "cosy"
                 except Exception:
                     logger.warning(f"[{job_id}] Voice cloning failed, falling back to gTTS")
@@ -155,12 +159,26 @@ def process_tts(self, payload):
             if method == "gtts":
                 try:
                     from gtts import gTTS
+                    # gTTS can save MP3 directly
                     gTTS(text=text, lang=lang[:2]).save(output_path)
                 except Exception:
                     logger.error(f"[{job_id}] gTTS failed")
                     if DEBUG:
                         logger.exception("gTTS exception")
                     raise
+
+            # If TTS model produced WAV (output_wav exists), convert to MP3 using ffmpeg if available
+            if 'output_wav' in locals() and Path(output_wav).exists():
+                try:
+                    import subprocess
+                    subprocess.run(['ffmpeg', '-y', '-i', str(output_wav), '-b:a', '192k', str(output_path)], check=True, capture_output=True, timeout=60)
+                    try:
+                        Path(output_wav).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"[{job_id}] ffmpeg conversion failed, attempting to upload WAV as fallback: {type(e).__name__}")
+                    output_path = output_wav
 
             if not Path(output_path).exists():
                 raise RuntimeError("TTS output file not created")
@@ -169,7 +187,7 @@ def process_tts(self, payload):
                 raise RuntimeError(f"TTS output file too small: {file_size} bytes")
 
             audio_url = None
-            if CLOUDINARY_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+            if CLOUDINARY_AVAILABLE:
                 try:
                     upload_resp = cloudinary_upload_with_retries(output_path, public_id=f"tts_{job_id}")
                     audio_url = upload_resp.get('secure_url') or upload_resp.get('url')
@@ -181,7 +199,7 @@ def process_tts(self, payload):
             else:
                 dest_dir = Path('/tmp/sl_audio')
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                dest_path = dest_dir / f"dub_{job_id}.wav"
+                dest_path = dest_dir / f"dub_{job_id}.mp3"
                 Path(output_path).rename(dest_path)
                 audio_url = f"file://{dest_path}"
 
@@ -194,8 +212,12 @@ def process_tts(self, payload):
             db.session.commit()
 
             try:
-                if tmp_output and Path(tmp_output).exists():
-                    Path(tmp_output).unlink(missing_ok=True)
+                for p in [locals().get('tmp_wav'), locals().get('tmp_mp3'), locals().get('tmp_output')]:
+                    if p and Path(p).exists():
+                        try:
+                            Path(p).unlink(missing_ok=True)
+                        except Exception:
+                            pass
             except Exception:
                 logger.warning(f"[{job_id}] Failed to cleanup tmp output")
 
@@ -224,8 +246,12 @@ def process_tts(self, payload):
                 logger.error(f"[{job_id}] Failed to update DB during error handling")
 
             try:
-                if tmp_output and Path(tmp_output).exists():
-                    Path(tmp_output).unlink(missing_ok=True)
+                for p in [locals().get('tmp_wav'), locals().get('tmp_mp3'), locals().get('tmp_output')]:
+                    if p and Path(p).exists():
+                        try:
+                            Path(p).unlink(missing_ok=True)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
