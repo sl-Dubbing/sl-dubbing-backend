@@ -1,480 +1,199 @@
-# server.py — sl-Dubbing Backend (Enterprise Edition - SECURED & ENHANCED)
-import os, uuid, time, logging, subprocess, re, json, gc, sys
+# server.py
+import os, uuid, time, logging, re
 from pathlib import Path
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
 from dotenv import load_dotenv
-
-# استيراد مكتبات الأمان الجديدة (JWT و Rate Limiter)
 import jwt
+from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+# Load env
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-)
+
+# Logging
+DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
+logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# الموافقة التلقائية على شروط Coqui TTS لحل مشكلة الـ Deploy
-os.environ["COQUI_TOS_AGREED"] = "1"
+# Config constants
+ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500', 'http://127.0.0.1:5500']
+ALLOWED_LANGS = ['ar', 'en', 'es', 'fr', 'de', 'it', 'pt', 'tr', 'ru', 'zh', 'ja', 'ko', 'yue', 'hi', 'ur']
+ALLOWED_VOICE_MODES = ['gtts', 'xtts', 'cosy', 'source']
+MAX_TEXT_LENGTH = 10000
 
-# ============================================================================
-# FLASK, CORS & SECURITY SETUP
-# ============================================================================
-
+# Flask app
 app = Flask(__name__)
-# تمكين إرسال الكوكيز (Credentials) في طلبات الـ CORS
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
-
-# مفتاح التشفير السري الخاص بالـ JWT
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-key-sl-dubbing-2026')
-
-# تهيئة جدار الحماية (Rate Limiter)
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["1000 per day", "100 per hour"],
-    storage_uri="memory://"
-)
-
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    return response
-
-# ============================================================================
-# DATABASE CONFIGURATION
-# ============================================================================
+app.config['DEBUG'] = DEBUG
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY')
+if not app.config['SECRET_KEY']:
+    raise ValueError("SECRET_KEY must be set")
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:
-    logger.warning("⚠️ DATABASE_URL not set, using SQLite (dev only)")
-    DATABASE_URL = 'sqlite:///sl_dubbing.db'
-
+    raise ValueError("DATABASE_URL must be set")
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JSON_SORT_KEYS'] = False
 
-db = SQLAlchemy(app)
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day", "100 per hour"], storage_uri="memory://")
 
-# ============================================================================
-# DATABASE MODELS
-# ============================================================================
+# Import shared models and init db
+from models import db, User, DubbingJob, CreditTransaction
+db.init_app(app)
 
-class User(db.Model):
-    __tablename__ = 'users'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
-    name = db.Column(db.String(100), nullable=False)
-    avatar = db.Column(db.String(500), default='👤')
-    credits = db.Column(db.Integer, default=50000) 
-    password_hash = db.Column(db.String(255), nullable=True)
-    auth_method = db.Column(db.String(50), default='oauth')
-    last_login = db.Column(db.DateTime, default=datetime.utcnow)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    
-    jobs = db.relationship('DubbingJob', backref='user', lazy=True, cascade='all, delete-orphan')
-    credit_history = db.relationship('CreditTransaction', backref='user', lazy=True, cascade='all, delete-orphan')
-    
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-    
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'email': self.email,
-            'name': self.name,
-            'avatar': self.avatar,
-            'credits': self.credits,
-            'auth_method': self.auth_method,
-            'created_at': self.created_at.isoformat()
-        }
+# Import Celery task entrypoint (tasks.py defines celery_app and process_tts)
+# We import lazily inside function to avoid circular import at module import time
+def get_celery():
+    # tasks.py must be in same package; import here to avoid circular import issues
+    import tasks
+    return tasks.celery_app, tasks.process_tts
 
-class DubbingJob(db.Model):
-    __tablename__ = 'dubbing_jobs'
-    
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    
-    status = db.Column(db.String(20), default='pending')
-    language = db.Column(db.String(10), nullable=False)
-    voice_mode = db.Column(db.String(50), nullable=False) 
-    voice_id = db.Column(db.String(100), nullable=True)
-    
-    text_length = db.Column(db.Integer, default=0)
-    credits_used = db.Column(db.Integer, default=0)
-    
-    input_url = db.Column(db.String(500), nullable=True)
-    output_url = db.Column(db.String(500), nullable=True)
-    
-    error_message = db.Column(db.Text, nullable=True)
-    processing_time = db.Column(db.Float, nullable=True)
-    
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class CreditTransaction(db.Model):
-    __tablename__ = 'credit_transactions'
-    
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    
-    transaction_type = db.Column(db.String(20), nullable=False)
-    amount = db.Column(db.Integer, nullable=False)
-    reason = db.Column(db.String(200), nullable=False)
-    
-    job_id = db.Column(db.String(36), nullable=True)
-    payment_id = db.Column(db.String(100), nullable=True)
-    
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-
-# ============================================================================
-# JWT AUTHENTICATION MIDDLEWARE
-# ============================================================================
-
+# Helpers
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if request.method == 'OPTIONS':
-            return f(*args, **kwargs)
-            
-        # استخراج التوكن المشفر من الـ Cookies المحمية
+        if request.method == 'OPTIONS': return f(*args, **kwargs)
         token = request.cookies.get('sl_auth_token')
-        
-        if not token:
-            return jsonify({'error': 'غير مصرح لك. يرجى تسجيل الدخول.'}), 401
-        
+        if not token: return jsonify({'error': 'Unauthorized'}), 401
         try:
-            # فك التشفير والتحقق من الجلسة
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            user = User.query.get(data['user_id'])
-            
+            user_id = data.get('user_id')
+            if not user_id:
+                raise ValueError("Missing user_id")
+            user = User.query.get(user_id)
             if not user:
-                raise Exception("User not found")
-                
+                raise ValueError("User not found")
             request.user = user
         except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'انتهت صلاحية الجلسة. يرجى تسجيل الدخول مجدداً.'}), 401
+            return jsonify({'error': 'Token expired'}), 401
+        except (jwt.InvalidTokenError, ValueError, KeyError):
+            ip = request.remote_addr or request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or 'unknown'
+            logger.warning(f"Invalid token attempt from IP: {ip}")
+            return jsonify({'error': 'Session expired or invalid.'}), 401
         except Exception as e:
-            return jsonify({'error': 'جلسة غير صالحة.'}), 401
-            
+            if app.config.get('DEBUG'):
+                logger.exception("Unexpected auth error")
+            else:
+                logger.error(f"Unexpected auth error: {type(e).__name__}")
+            return jsonify({'error': 'Session expired or invalid.'}), 401
         return f(*args, **kwargs)
     return decorated_function
 
-# ============================================================================
-# DIRECTORY SETUP
-# ============================================================================
+def is_valid_srt(srt_text):
+    if not srt_text: return False
+    if srt_text.count('-->') < 1: return False
+    timestamp_pattern = r'\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}'
+    return re.search(timestamp_pattern, srt_text) is not None
 
-AUDIO_DIR = Path('/tmp/sl_audio')
-VOICE_DIR = Path('/tmp/sl_voices')
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-VOICE_DIR.mkdir(parents=True, exist_ok=True)
-VOICE_CACHE = {}
-
-# ============================================================================
-# SMART ENGINE MANAGER (LAZY LOADING)
-# ============================================================================
-
-XTTS_MODEL = None
-COSY_MODEL = None
-ACTIVE_ENGINE = None
-
-def unload_engines():
-    global XTTS_MODEL, COSY_MODEL, ACTIVE_ENGINE
-    if XTTS_MODEL is not None or COSY_MODEL is not None:
-        logger.info("🧹 Unloading AI Models to free VRAM...")
-        XTTS_MODEL = None
-        COSY_MODEL = None
-        ACTIVE_ENGINE = None
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-def get_cosy():
-    global COSY_MODEL, ACTIVE_ENGINE
-    if ACTIVE_ENGINE == 'xtts': 
-        unload_engines()
-    
-    if COSY_MODEL is None:
-        try:
-            from modelscope import snapshot_download
-            if '/app/CosyVoice' not in sys.path:
-                sys.path.append('/app/CosyVoice')
-            from cosyvoice.cli.cosyvoice import CosyVoice
-            logger.info("⏳ Loading CosyVoice 3.0...")
-            model_dir = snapshot_download('iic/CosyVoice-300M')
-            COSY_MODEL = CosyVoice(model_dir)
-            ACTIVE_ENGINE = 'cosy'
-            logger.info("✅ CosyVoice 3.0 loaded successfully")
-        except Exception as e:
-            logger.error(f"❌ CosyVoice initialization failed: {e}")
-            return None
-    return COSY_MODEL
-
-def get_xtts():
-    global XTTS_MODEL, ACTIVE_ENGINE
-    if ACTIVE_ENGINE == 'cosy': 
-        unload_engines()
-        
-    if XTTS_MODEL is None:
-        try:
-            from TTS.api import TTS
-            logger.info("⏳ Loading XTTS v2...")
-            # تجاوز انتظار الموافقة اليدوية على الرخصة
-            XTTS_MODEL = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-            ACTIVE_ENGINE = 'xtts'
-            logger.info("✅ XTTS v2 loaded successfully")
-        except Exception as e:
-            logger.error(f"❌ XTTS initialization failed: {e}")
-            return None
-    return XTTS_MODEL
-
-import threading
-init_thread = threading.Thread(target=get_xtts, daemon=True)
-init_thread.start()
-
-# ============================================================================
-# API ROUTES
-# ============================================================================
-
-@app.route('/api/health', methods=['GET'])
-def health():
-    return jsonify({
-        'status': 'ok',
-        'timestamp': datetime.utcnow().isoformat(),
-        'active_engine': ACTIVE_ENGINE,
-        'database': 'connected' if db.session.execute(db.text('SELECT 1')) else 'error'
-    })
-
-# ── مسار التحقق الرسمي من جوجل وإصدار التوكن ──
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
-
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "497619073475-6vjelufub8gci231ettdhmk5pv0cdde3.apps.googleusercontent.com")
-
-@app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
-def google_auth():
-    if request.method == 'OPTIONS':
-        return jsonify({'ok': True}), 200
-    
-    try:
-        data = request.get_json()
-        token = data.get('credential')
-        
-        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
-        
-        email = idinfo['email']
-        name = idinfo.get('name', email.split('@')[0])
-        picture = idinfo.get('picture', '👤')
-        
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            user = User(
-                email=email,
-                name=name,
-                avatar=picture,
-                auth_method='google',
-                credits=50000
-            )
-            db.session.add(user)
-            logger.info(f"✅ New real Google user created: {email}")
-        else:
-            user.last_login = datetime.utcnow()
-            user.avatar = picture 
-            logger.info(f"✅ Google user logged in: {email}")
-            
-        db.session.commit()
-        
-        # إنشاء الهوية الرقمية (JWT) صالحة لمدة 7 أيام
-        auth_token = jwt.encode({
-            'user_id': user.id,
-            'exp': datetime.utcnow() + timedelta(days=7)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
-        
-        # تغليف الرد لإرفاق الـ Cookie المحمية (HttpOnly)
-        resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
-        resp.set_cookie(
-            'sl_auth_token', 
-            auth_token, 
-            httponly=True, 
-            secure=True,          # تعمل عبر HTTPS فقط
-            samesite='None',      # للسماح بالاتصال من Github Pages إلى Railway
-            max_age=7*24*60*60
-        )
-        return resp
-        
-    except ValueError as e:
-        logger.error(f"❌ Invalid Google Token: {e}")
-        return jsonify({'success': False, 'error': 'توكن غير صالح من جوجل'}), 401
-    except Exception as e:
-        logger.error(f"❌ Google Auth Error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/user', methods=['GET', 'OPTIONS'])
-@require_auth # تمت حماية هذا المسار
-def get_user():
-    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
-    user = request.user
-    return jsonify({'success': True, 'user': user.to_dict(), 'credits': user.credits}), 200
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def deduct_credits(user, text_length):
-    if user.credits < text_length: return False, "رصيدك غير كافٍ"
-    user.credits -= text_length
-    transaction = CreditTransaction(user_id=user.id, transaction_type='usage', amount=-text_length, reason=f'Text generation: {text_length} characters')
-    db.session.add(transaction)
-    db.session.commit()
-    return True, user.credits
-
-def fetch_voice_sample(voice_url, voice_id):
-    if voice_id in VOICE_CACHE and Path(VOICE_CACHE[voice_id]).exists(): return VOICE_CACHE[voice_id]
-    try:
-        import urllib.request
-        local_path = VOICE_DIR / f"{voice_id}.wav"
-        if not local_path.exists():
-            tmp = VOICE_DIR / f"{voice_id}.tmp.mp3"
-            urllib.request.urlretrieve(voice_url, str(tmp))
-            subprocess.run(['ffmpeg', '-y', '-i', str(tmp), '-ar', '22050', '-ac', '1', str(local_path)], capture_output=True, timeout=30)
-            tmp.unlink(missing_ok=True)
-        if local_path.exists():
-            VOICE_CACHE[voice_id] = str(local_path)
-            return str(local_path)
-    except Exception as e: logger.error(f"Voice download error: {e}")
-    return None
-
-def synthesize_cosy(text, voice_path, output_path):
-    try:
-        engine = get_cosy()
-        if engine is None: return None, "CosyVoice not ready"
-        from cosyvoice.utils.file_utils import load_wav
-        import torchaudio
-        prompt_speech_16k = load_wav(voice_path, 16000)
-        output = engine.inference_zero_shot(text, "نص العينة للمحاكاة", prompt_speech_16k)
-        torchaudio.save(output_path, output['tts_speech'], 22050)
-        if Path(output_path).exists(): return output_path, "cosyvoice"
-        return None, "Empty output"
-    except Exception as e:
-        logger.error(f"CosyVoice error: {e}")
-        return None, str(e)
-
-def synthesize_xtts(text, lang, voice_path, output_path):
-    try:
-        engine = get_xtts()
-        if engine is None: return None, "XTTS not ready"
-        engine.tts_to_file(text=text, speaker_wav=voice_path, language=lang[:2], file_path=output_path)
-        if Path(output_path).exists(): return output_path, "xtts"
-        return None, "Empty output"
-    except Exception as e:
-        logger.error(f"XTTS error: {e}")
-        return None, str(e)
-
-def synthesize_gtts(text, lang, output_path):
-    try:
-        from gtts import gTTS
-        gTTS(text=text, lang=lang[:2]).save(output_path)
-        return output_path, "gtts"
-    except Exception as e:
-        logger.error(f"gTTS error: {e}")
-        return None, str(e)
-
-# ============================================================================
-# MAIN DUBBING ROUTE
-# ============================================================================
-
+# Routes
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
-@limiter.limit("5 per minute") # حماية من طلبات التوليد العشوائية والمفرطة (Brute Force)
+@require_auth
+@limiter.limit("5 per minute")
 def dub():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get('text') or '').strip()
+    srt = (data.get('srt') or '').strip()
+    lang = data.get('lang', 'ar')
+    voice_mode = data.get('voice_mode', 'gtts')
+    voice_id = data.get('voice_id', '')
+    voice_url = data.get('voice_url', '')
+
+    if lang not in ALLOWED_LANGS:
+        return jsonify({'success': False, 'error': 'Invalid language selected'}), 400
+    if voice_mode not in ALLOWED_VOICE_MODES:
+        return jsonify({'success': False, 'error': 'Invalid voice mode'}), 400
+    if voice_mode in ['xtts', 'cosy'] and (not voice_id or not voice_url):
+        return jsonify({'success': False, 'error': 'Voice URL and Voice ID required for cloning modes'}), 400
+    if voice_url and not voice_url.startswith('https://'):
+        return jsonify({'success': False, 'error': 'Invalid voice URL. HTTPS required.'}), 400
+    if not text and srt and not is_valid_srt(srt):
+        return jsonify({'success': False, 'error': 'Invalid SRT format detected'}), 400
+
+    text_length = len(text) if text else len(srt)
+    if text_length < 5:
+        return jsonify({'success': False, 'error': 'Text too short'}), 400
+    if text_length > MAX_TEXT_LENGTH:
+        return jsonify({'success': False, 'error': f'Text exceeds maximum allowed length ({MAX_TEXT_LENGTH})'}), 400
+
+    user = request.user
+    # Reserve credits and create job
+    if user.credits < text_length:
+        return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
+
+    job_id = str(uuid.uuid4())
     try:
-        data = request.get_json(force=True) or {}
-        email = data.get('email', '').lower().strip()
-        text = data.get('text', '').strip()
-        srt = data.get('srt', '').strip()
-        lang = data.get('lang', 'ar')
-        voice_mode = data.get('voice_mode', 'gtts')
-        voice_id = data.get('voice_id', '')
-        voice_url = data.get('voice_url', '')
-        
-        user = User.query.filter_by(email=email).first()
-        if not user: return jsonify({'success': False, 'error': 'User not found'}), 404
-        
-        text_length = len(text) if text else len(srt)
-        if text_length < 5: return jsonify({'success': False, 'error': 'Text too short'}), 400
-        
-        if user.credits < text_length: return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
-        
-        job_id = str(uuid.uuid4())
-        job = DubbingJob(id=job_id, user_id=user.id, language=lang, voice_mode=voice_mode, text_length=text_length)
+        user.credits -= text_length
+        db.session.add(CreditTransaction(user_id=user.id, transaction_type='usage', amount=-text_length, reason='Dubbing'))
+        job = DubbingJob(id=job_id, user_id=user.id, language=lang, voice_mode=voice_mode, text_length=text_length, credits_used=text_length, status='processing')
         db.session.add(job)
-        
-        success, result = deduct_credits(user, text_length)
-        if not success: return jsonify({'success': False, 'error': result}), 402
-        
-        job.credits_used = text_length
-        job.status = 'processing'
         db.session.commit()
-        
-        t0 = time.time()
-        voice_path = fetch_voice_sample(voice_url, voice_id) if voice_url else None
-        output_path = str(AUDIO_DIR / f"dub_{job_id}.mp3")
-        method = "none"
-        
-        if voice_mode == 'cosy' and voice_path:
-            output_path, method = synthesize_cosy(text, voice_path, output_path)
-        elif voice_mode == 'xtts' and voice_path:
-            output_path, method = synthesize_xtts(text, lang, voice_path, output_path)
-        else:
-            output_path, method = synthesize_gtts(text, lang, output_path)
-        
-        if not output_path or not Path(output_path).exists():
-            job.status = 'failed'
-            db.session.commit()
-            return jsonify({'success': False, 'error': 'فشل توليد الصوت'}), 500
-        
-        audio_url = f"https://{request.host}/api/file/{Path(output_path).name}"
-        job.output_url = audio_url
-        job.status = 'completed'
-        job.processing_time = time.time() - t0
-        db.session.commit()
-        
-        return jsonify({'success': True, 'job_id': job_id, 'audio_url': audio_url, 'method': method, 'remaining_credits': user.credits}), 200
-    
     except Exception as e:
-        logger.error(f"DUB error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        db.session.rollback()
+        logger.error(f"DB error reserving credits/job: {type(e).__name__}")
+        return jsonify({'success': False, 'error': 'Internal error reserving job'}), 500
 
-@app.route('/api/file/<filename>')
-def get_file(filename):
-    p = AUDIO_DIR / filename
-    if not p.exists(): return jsonify({'error': 'File not found'}), 404
-    mime = 'audio/wav' if str(p).endswith('.wav') else 'audio/mpeg'
-    return send_file(str(p), mimetype=mime, as_attachment=False)
+    # Enqueue Celery task
+    try:
+        celery_app, process_tts = get_celery()
+        payload = {
+            'job_id': job_id,
+            'user_id': user.id,
+            'text': text,
+            'srt': srt,
+            'lang': lang,
+            'voice_mode': voice_mode,
+            'voice_id': voice_id,
+            'voice_url': voice_url
+        }
+        task = process_tts.delay(payload)
+        logger.info(f"Enqueued TTS task: job_id={job_id} task_id={task.id}")
+    except Exception as e:
+        # rollback reservation if enqueue fails
+        try:
+            job = DubbingJob.query.get(job_id)
+            if job:
+                job.status = 'failed'
+            user.credits += text_length
+            db.session.add(CreditTransaction(user_id=user.id, transaction_type='refund', amount=text_length, reason='Enqueue failed'))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        logger.error(f"Failed to enqueue task: {type(e).__name__}")
+        return jsonify({'success': False, 'error': 'Failed to start background processing'}), 500
 
+    return jsonify({'success': True, 'job_id': job_id, 'task_id': task.id, 'status': 'processing', 'remaining_credits': user.credits}), 200
+
+@app.route('/api/job/<job_id>', methods=['GET'])
+@require_auth
+def get_job(job_id):
+    job = DubbingJob.query.get(job_id)
+    if not job or job.user_id != request.user.id:
+        return jsonify({'success': False, 'error': 'Job not found'}), 404
+    return jsonify({
+        'success': True,
+        'job_id': job.id,
+        'status': job.status,
+        'audio_url': job.output_url,
+        'method': job.method,
+        'processing_time': job.processing_time,
+        'credits_used': job.credits_used,
+        'created_at': job.created_at.isoformat()
+    }), 200
+
+# Health
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'timestamp': datetime.utcnow().isoformat()}), 200
+
+# Create DB tables if run directly
 with app.app_context():
     db.create_all()
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), threaded=True)
