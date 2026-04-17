@@ -17,4 +17,4 @@ PyJWT==2.8.0
 Flask-Limiter==3.7.0
 gTTS==2.4.0
 # CosyVoice placeholder - استبدل بالاسم الصحيح إن اختلف
-cosyvoice==3.0.0
+#cosyvoice==3.0.0
