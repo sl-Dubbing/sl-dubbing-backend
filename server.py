@@ -59,9 +59,9 @@ try:
     import cloudinary
     import cloudinary.uploader
     CLOUDINARY_AVAILABLE = True
-    CLOUDINARY_NAME = os.getenv('CLOUDINARY_NAME')
-    CLOUDINARY_API_KEY = os.getenv('CLOUDINARY_API_KEY')
-    CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET')
+    CLOUDINARY_NAME = os.getenv('dxbmvzsiz')
+    CLOUDINARY_API_KEY = os.getenv('0wmWqlKFRVmqbE8lBbYDYeUQ24E')
+    CLOUDINARY_API_SECRET = os.getenv('295811796272148')
     if CLOUDINARY_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
         cloudinary.config(cloud_name=CLOUDINARY_NAME, api_key=CLOUDINARY_API_KEY, api_secret=CLOUDINARY_API_SECRET, secure=True)
     else:
