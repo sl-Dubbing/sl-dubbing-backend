@@ -17,6 +17,10 @@ from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+# استيراد مكتبات جوجل للتحقق من تسجيل الدخول
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 load_dotenv()
 
 DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
@@ -232,6 +236,46 @@ def login():
     db.session.commit()
     return generate_auth_response(user)
 
+@app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def google_login():
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True}), 200
+        
+    data = request.get_json(force=True, silent=True)
+    if not data or 'credential' not in data:
+        return jsonify({'success': False, 'error': 'Missing credential'}), 400
+        
+    token = data['credential']
+    try:
+        # التحقق من صحة الرمز باستخدام جوجل
+        CLIENT_ID = "497619073475-6vjelufub8gci231ettdhmk5pv0cdde3.apps.googleusercontent.com"
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
+        
+        email = idinfo['email']
+        name = idinfo.get('name', email.split('@')[0])
+        
+        # البحث عن المستخدم أو إنشاء حساب جديد
+        user = User.query.filter_by(email=email).first()
+        is_new = False
+        if not user:
+            user = User(email=email, name=name, auth_method='google', credits=50000)
+            db.session.add(user)
+            db.session.commit()
+            is_new = True
+            
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        
+        # إنشاء الجلسة وإرسال الرد للواجهة
+        return generate_auth_response(user, is_new=is_new)
+        
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid Google token'}), 401
+    except Exception as e:
+        logger.error(f"Google login error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
 def logout():
     if request.method == 'OPTIONS':
@@ -373,44 +417,6 @@ def health():
 
 with app.app_context():
     db.create_all()
-@app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
-@limiter.limit("10 per minute")
-def google_login():
-    if request.method == 'OPTIONS':
-        return jsonify({'ok': True}), 200
-        
-    data = request.get_json(force=True, silent=True)
-    if not data or 'credential' not in data:
-        return jsonify({'success': False, 'error': 'Missing credential'}), 400
-        
-    token = data['credential']
-    try:
-        # التحقق من صحة الرمز باستخدام جوجل
-        CLIENT_ID = "497619073475-6vjelufub8gci231ettdhmk5pv0cdde3.apps.googleusercontent.com"
-        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
-        
-        email = idinfo['email']
-        name = idinfo.get('name', email.split('@')[0])
-        
-        # البحث عن المستخدم أو إنشاء حساب جديد
-        user = User.query.filter_by(email=email).first()
-        is_new = False
-        if not user:
-            user = User(email=email, name=name, auth_method='google', credits=50000)
-            db.session.add(user)
-            db.session.commit()
-            is_new = True
-            
-        user.last_login = datetime.utcnow()
-        db.session.commit()
-        
-        # إنشاء الجلسة وإرسال الرد للواجهة
-        return generate_auth_response(user, is_new=is_new)
-        
-    except ValueError:
-        return jsonify({'success': False, 'error': 'Invalid Google token'}), 401
-    except Exception as e:
-        logger.error(f"Google login error: {e}")
-        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), threaded=True)
