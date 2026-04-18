@@ -239,15 +239,11 @@ def process_full_workflow(payload):
         else:
              raise ValueError("No valid input provided.")
 
-       # 2. Transcription via OpenAI API (Blazing Fast!)
-        logger.info(f"[{job_id}] Sending audio to OpenAI for extremely fast STT...")
-        with open(audio_file_path, "rb") as audio_file:
-            # نطلب من خوادمهم القوية تفريغ الصوت وإعادته بصيغة SRT مباشرة
-            raw_srt = openai.Audio.transcribe(
-                model="whisper-1",
-                file=audio_file,
-                response_format="srt"
-            )
+        # 2. Transcription (STT)
+        logger.info(f"[{job_id}] Starting transcription...")
+        model = whisper.load_model("base") # Using 'base' for faster processing on Railway, change to 'small' or 'medium' if you have enough RAM
+        result = model.transcribe(audio_file_path)
+        raw_srt = generate_srt(result["segments"])
 
         # 3. Smart Correction
         logger.info(f"[{job_id}] Applying smart correction...")
