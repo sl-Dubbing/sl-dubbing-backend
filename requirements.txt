@@ -32,3 +32,4 @@ ffmpeg-python
 
 # CosyVoice placeholder - استبدل بالاسم الصحيح إن اختلف
 #cosyvoice==3.0.0
+openai==0.28.0
