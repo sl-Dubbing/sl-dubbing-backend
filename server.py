@@ -1,4 +1,3 @@
-// script.js
 const API_BASE = 'https://web-production-14a1.up.railway.app';
 const GITHUB_USER = "sl-Dubbing"; 
 const REPO_NAME = "sl-dubbing-frontend";
@@ -12,6 +11,7 @@ document.addEventListener('DOMContentLoaded', () => {
     loadVoicesFromGithub();
     checkAuth();
     
+    // إعداد اللغات
     const langGrid = document.getElementById('langGrid');
     if (langGrid) {
         const langs = ['ar','en','es','fr','de','it','pt','tr','ru','zh','ja','ko','hi'];
@@ -29,12 +29,62 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    const srtFile = document.getElementById('srtFile');
-    if (srtFile) {
-        srtFile.addEventListener('change', () => {
-            if (srtFile.files.length) {
-                document.getElementById('srtZone').innerText = srtFile.files[0].name;
-                document.getElementById('srtZone').classList.add('ok');
+    // ---------------- التفاعل البصري لرفع الملفات وروابط اليوتيوب ----------------
+    const mediaFile = document.getElementById('mediaFile');
+    const mediaZone = document.getElementById('mediaZone');
+    const ytUrlInput = document.getElementById('ytUrl');
+
+    // 1. عند اختيار ملف من الجهاز
+    if (mediaFile && mediaZone) {
+        mediaFile.addEventListener('change', () => {
+            if (mediaFile.files.length > 0) {
+                const file = mediaFile.files[0];
+                const iconClass = file.type.startsWith('video') ? 'fa-file-video' : 'fa-file-audio';
+                
+                mediaZone.innerHTML = `
+                    <i class="fas ${iconClass} fa-beat" style="font-size:2.5rem; margin-bottom:10px; color:#065f2c; display:block;"></i>
+                    <span style="font-weight:bold; color:#065f2c;">تم تجهيز الملف:</span><br>
+                    <span style="font-size:0.9rem; color:#111827;">${file.name}</span>
+                `;
+                mediaZone.style.borderColor = '#065f2c';
+                mediaZone.style.background = '#f0fdf4';
+
+                // مسح رابط اليوتيوب وإلغاء تفعيله لتجنب التضارب
+                if (ytUrlInput) {
+                    ytUrlInput.value = '';
+                    ytUrlInput.style.borderColor = 'var(--border)';
+                    ytUrlInput.style.boxShadow = 'none';
+                }
+            }
+        });
+    }
+
+    // 2. عند لصق رابط يوتيوب
+    if (ytUrlInput) {
+        ytUrlInput.addEventListener('input', () => {
+            const url = ytUrlInput.value.trim();
+            const ytRegex = /^(https?\:\/\/)?(www\.youtube\.com|youtu\.?be)\/.+$/;
+
+            if (ytRegex.test(url)) {
+                ytUrlInput.style.borderColor = '#065f2c';
+                ytUrlInput.style.boxShadow = '0 0 0 2px rgba(6, 95, 44, 0.2)';
+                showToast("✅ تم التعرف على رابط يوتيوب بنجاح!", "#065f2c");
+
+                if (mediaFile) mediaFile.value = '';
+                if (mediaZone) {
+                    mediaZone.innerHTML = `
+                        <i class="fas fa-cloud-upload-alt" style="font-size:2rem; margin-bottom:10px; color:#9ca3af; display:block;"></i>
+                        انقر هنا لرفع ملف فيديو أو صوت من جهازك
+                    `;
+                    mediaZone.style.borderColor = 'var(--border)';
+                    mediaZone.style.background = 'transparent';
+                }
+            } else if (url.length > 0) {
+                ytUrlInput.style.borderColor = '#b91c1c';
+                ytUrlInput.style.boxShadow = 'none';
+            } else {
+                ytUrlInput.style.borderColor = 'var(--border)';
+                ytUrlInput.style.boxShadow = 'none';
             }
         });
     }
@@ -77,55 +127,58 @@ function selectVoice(id, el) {
     }
 }
 
+// ---------------- الدبلجة التلقائية (مخفية بالكامل) ----------------
 window.startDubbing = async function() {
     const btn = document.getElementById('startBtn');
-    const srtInput = document.getElementById('srtFile');
-    
-    if (!srtInput.files.length) {
-        showToast("يرجى رفع ملف SRT", "#b91c1c");
+    const ytUrlInput = document.getElementById('ytUrl');
+    const ytUrl = ytUrlInput ? ytUrlInput.value.trim() : '';
+    const mediaInput = document.getElementById('mediaFile');
+    const mediaFile = mediaInput && mediaInput.files.length ? mediaInput.files[0] : null;
+
+    if (!ytUrl && !mediaFile) {
+        showToast("يرجى وضع رابط يوتيوب أو رفع ملف", "#b91c1c");
         return;
     }
 
     btn.disabled = true;
-    btn.innerText = "جاري الإرسال للسيرفر...";
-    
-    const srtText = await srtInput.files[0].text();
-    
-    // إصلاح الخطأ: إرسال رابط العينة الصوتية من جيتهب لكي يقلدها السيرفر
+    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> جاري الإرسال للسيرفر...`;
+
+    // إرسال رابط العينة الصوتية لكي يقلدها السيرفر
     const voiceUrl = selectedVoice === 'source' ? '' : `https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main/samples/${selectedVoice}.mp3`;
+
+    // استخدام FormData بدلاً من JSON لدعم رفع الملفات الحقيقية
+    const formData = new FormData();
+    formData.append('lang', selectedLang);
+    formData.append('voice_mode', selectedVoice === 'source' ? 'source' : 'xtts');
+    formData.append('voice_id', selectedVoice === 'source' ? '' : selectedVoice);
+    formData.append('voice_url', voiceUrl);
     
-    const payload = { 
-        srt: srtText, 
-        lang: selectedLang, 
-        voice_mode: selectedVoice === 'source' ? 'source' : 'xtts', 
-        voice_id: selectedVoice === 'source' ? '' : selectedVoice,
-        voice_url: voiceUrl 
-    };
+    if (ytUrl) formData.append('yt_url', ytUrl);
+    if (mediaFile) formData.append('media_file', mediaFile);
 
     try {
         const res = await fetch(API_BASE + '/api/dub', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            body: formData, // إرسال الملفات والبيانات
             credentials: 'include'
         });
         const data = await res.json();
-        
+
         if (data.success) {
             currentJobId = data.job_id;
             document.getElementById('progressArea').style.display = 'block';
-            document.getElementById('statusTxt').innerText = 'تم الاستلام! جاري المعالجة...';
+            document.getElementById('statusTxt').innerText = 'تم الاستلام! جاري المعالجة الآلية بالكامل...';
             document.getElementById('progBar').style.width = '5%';
             pollInterval = setInterval(() => pollJob(currentJobId), 2000);
         } else { 
             showToast("خطأ: " + data.error, "#b91c1c"); 
             btn.disabled = false; 
-            btn.innerText = "ابدأ معالجة الدبلجة";
+            btn.innerHTML = `<i class="fas fa-bolt"></i> ابدأ معالجة الدبلجة الآن`;
         }
     } catch (e) { 
         showToast("فشل الاتصال بالسيرفر", "#b91c1c"); 
         btn.disabled = false; 
-        btn.innerText = "ابدأ معالجة الدبلجة";
+        btn.innerHTML = `<i class="fas fa-bolt"></i> ابدأ معالجة الدبلجة الآن`;
     }
 };
 
@@ -133,27 +186,31 @@ async function pollJob(jobId) {
     try {
         const res = await fetch(API_BASE + '/api/job/' + jobId, { credentials: 'include' });
         const data = await res.json();
-        
+
         if (data.status === 'processing') {
-            document.getElementById('statusTxt').innerText = 'قيد المعالجة وتوليد الصوت...';
+            document.getElementById('statusTxt').innerText = 'جاري استخراج الصوت، التصحيح الذكي، والدبلجة...';
             const bar = document.getElementById('progBar');
-            let cur = parseInt(bar.style.width) || 10;
-            cur = Math.min(90, cur + 5);
-            bar.style.width = cur + '%';
-            document.getElementById('pctTxt').innerText = cur + '%';
-            
+            const pct = document.getElementById('pctTxt');
+            if (bar) {
+                let cur = parseInt(bar.style.width) || 10;
+                cur = Math.min(90, cur + 1); // تقدم بطيء ليعكس العمليات المتعددة في السيرفر
+                bar.style.width = cur + '%';
+                if (pct) pct.innerText = cur + '%';
+            }
         } else if (data.status === 'completed') {
             clearInterval(pollInterval);
-            document.getElementById('statusTxt').innerText = 'اكتملت المعالجة!';
+            document.getElementById('statusTxt').innerText = 'اكتملت المعالجة السحرية!';
             document.getElementById('progBar').style.width = '100%';
             document.getElementById('pctTxt').innerText = '100%';
-            
+
             document.getElementById('resCard').style.display = 'block';
             document.getElementById('dubAud').src = data.audio_url;
             document.getElementById('dlBtn').href = data.audio_url;
+
+            const btn = document.getElementById('startBtn');
+            btn.disabled = false;
+            btn.innerHTML = `<i class="fas fa-bolt"></i> ابدأ معالجة الدبلجة الآن`;
             
-            document.getElementById('startBtn').disabled = false;
-            document.getElementById('startBtn').innerText = "ابدأ معالجة الدبلجة";
             showToast("تمت الدبلجة بنجاح!", "#065f2c");
             checkAuth(); // تحديث الرصيد
             
@@ -161,8 +218,10 @@ async function pollJob(jobId) {
             clearInterval(pollInterval);
             document.getElementById('statusTxt').innerText = 'فشلت المعالجة';
             showToast("فشلت عملية الدبلجة. تم استرجاع الرصيد.", "#b91c1c");
-            document.getElementById('startBtn').disabled = false;
-            document.getElementById('startBtn').innerText = "ابدأ معالجة الدبلجة";
+            
+            const btn = document.getElementById('startBtn');
+            btn.disabled = false;
+            btn.innerHTML = `<i class="fas fa-bolt"></i> ابدأ معالجة الدبلجة الآن`;
             checkAuth();
         }
     } catch (e) { console.error("Polling error", e); }
@@ -195,5 +254,11 @@ function showToast(msg, color='#0f0f10') {
     t.style.background = color;
     t.innerText = msg;
     const container = document.getElementById('toasts');
-    if (container) { container.appendChild(t); setTimeout(()=>{ t.remove(); }, 3500); }
+    if (container) { 
+        container.appendChild(t); 
+        setTimeout(()=>{ t.remove(); }, 3500); 
+    } else {
+        document.body.appendChild(t);
+        setTimeout(()=>{ t.remove(); }, 3500); 
+    }
 }
