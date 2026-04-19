@@ -129,7 +129,7 @@ def process_full_workflow(payload):
 
         logger.info(f"[{job_id}] Sending request to Modal GPU Factory...")
 
-        MODAL_URL = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run"
+        MODAL_URL = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
         
         response = requests.post(MODAL_URL, json={
             "yt_url": yt_url,
