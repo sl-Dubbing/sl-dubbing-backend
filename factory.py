@@ -5,7 +5,7 @@ import os, tempfile, subprocess, base64, urllib.request, shutil
 image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg", "libasound2", "libsndfile1")
-    .run_commands("echo 'Version 6.0 - Ultimate Bug Fix'")
+    .run_commands("echo 'Version 7.0 - Direct Audio Links'")
     .pip_install(
         "fastapi", "uvicorn", "openai-whisper", "TTS", 
         "soundfile", "transformers==4.35.2", 
@@ -30,7 +30,6 @@ def load_models():
         xtts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
     return whisper_model, xtts_model
 
-# --- مسار الدبلجة ---
 @web_app.post("/")
 async def process_dubbing(request: Request):
     data = await request.json()
@@ -61,8 +60,7 @@ async def process_dubbing(request: Request):
             speaker_wav = os.path.join(temp_dir, "sample.wav")
             try:
                 urllib.request.urlretrieve(voice_url, speaker_wav)
-            except Exception as e:
-                # 🟢 الدرع الواقي: إذا فشل الرابط، نستخدم الصوت الأصلي للفيديو بدلاً من التحطم!
+            except Exception:
                 speaker_wav = source_wav
 
         raw_ai_wav = os.path.join(temp_dir, "raw_ai.wav")
@@ -84,7 +82,6 @@ async def process_dubbing(request: Request):
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-# --- مسار الـ TTS ---
 @web_app.post("/tts")
 async def process_tts(request: Request):
     data = await request.json()
@@ -108,9 +105,9 @@ async def process_tts(request: Request):
             with open(speaker_wav, "wb") as f:
                 f.write(base64.b64decode(sample_b64))
         elif voice_id != "source":
-            speaker_wav = os.path.join(temp_dir, "github_ref.wav")
-            # 🟢 تصحيح المستودع للـ TTS أيضاً ليتمكن من جلب صوت محمد!
-            sample_url = f"https://raw.githubusercontent.com/sl-Dubbing/dubbing-studio/main/samples/{voice_id}.mp3"
+            speaker_wav = os.path.join(temp_dir, "website_ref.wav")
+            # 🟢 التعديل الأهم: جلب الصوت من رابط موقعك المباشر والمضمون
+            sample_url = f"https://sl-dubbing.github.io/samples/{voice_id}.mp3"
             try:
                 urllib.request.urlretrieve(sample_url, speaker_wav)
             except:
