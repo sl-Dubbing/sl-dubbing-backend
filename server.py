@@ -65,6 +65,26 @@ try:
 except Exception:
     CLOUDINARY_AVAILABLE = False
 
+def require_auth(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
+        token = request.cookies.get('sl_auth_token')
+        if not token:
+            return jsonify({'error': 'Unauthorized'}), 401
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            user = User.query.get(data.get('user_id'))
+            if not user:
+                raise ValueError("User not found")
+            request.user = user
+        except Exception:
+            return jsonify({'error': 'Session expired'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+# 🔴 هذه هي الدالة الصحيحة والوحيدة الآن (تم حذف التكرار)
 def generate_auth_response(user, is_new=False):
     token = jwt.encode({
         'user_id': user.id,
@@ -74,21 +94,9 @@ def generate_auth_response(user, is_new=False):
     }, app.config['SECRET_KEY'], algorithm='HS256')
     resp = make_response(jsonify({'success': True, 'user': user.to_dict(), 'is_new': is_new}))
     
-    # 🔴 السطر السحري: إجبار المتصفح على قبول الـ Cookie عبر الحدود بين GitHub و Railway
+    # إجبار المتصفح على قبول الـ Cookie عبر الحدود بين GitHub و Railway
     resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*60*60)
     
-    return resp
-
-def generate_auth_response(user, is_new=False):
-    token = jwt.encode({
-        'user_id': user.id,
-        'sub': user.email,
-        'iat': datetime.utcnow(),
-        'exp': datetime.utcnow() + timedelta(hours=24)
-    }, app.config['SECRET_KEY'], algorithm='HS256')
-    resp = make_response(jsonify({'success': True, 'user': user.to_dict(), 'is_new': is_new}))
-    secure_cookie = os.environ.get("ENV", "development") == "production"
-    resp.set_cookie('sl_auth_token', token, httponly=True, secure=secure_cookie, samesite='None' if secure_cookie else 'Lax', max_age=24*60*60)
     return resp
 
 def process_full_workflow(payload):
@@ -199,7 +207,6 @@ def login():
     if not user or not user.check_password(data.get('password')): return jsonify({'success': False, 'error': 'بيانات الدخول غير صحيحة'}), 401
     return generate_auth_response(user)
 
-# --------- تمت إضافة مسارات جوجل وتسجيل الخروج هنا ---------
 @app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
 def google_login():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
@@ -234,7 +241,6 @@ def logout():
     resp = make_response(jsonify({'success': True}))
     resp.set_cookie('sl_auth_token', '', expires=0, httponly=True, secure=True, samesite='None')
     return resp
-# -----------------------------------------------------------
 
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
 @require_auth
