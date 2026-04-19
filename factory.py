@@ -1,15 +1,15 @@
 import modal
 from fastapi import FastAPI, Request
-import os, tempfile, subprocess, base64, urllib.request, shutil
+import os, tempfile, subprocess, base64, shutil
 
 image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg", "libasound2", "libsndfile1")
-    .run_commands("echo 'Version 8.0 - Bulletproof Raw GitHub Links'")
+    .run_commands("echo 'Version 9.0 - Anti-Block Voice Downloader'")
     .pip_install(
         "fastapi", "uvicorn", "openai-whisper", "TTS", 
         "soundfile", "transformers==4.35.2", 
-        "torch==2.5.1", "torchaudio==2.5.1", "deep-translator"
+        "torch==2.5.1", "torchaudio==2.5.1", "deep-translator", "requests"
     )
     .env({"COQUI_TOS_AGREED": "1", "PYTHONIOENCODING": "utf-8", "LANG": "C.UTF-8"})
 )
@@ -32,6 +32,7 @@ def load_models():
 
 @web_app.post("/")
 async def process_dubbing(request: Request):
+    import requests # استدعاء المكتبة
     data = await request.json()
     file_b64 = data.get("file_b64")
     target_lang = data.get("lang", "ar")
@@ -59,8 +60,14 @@ async def process_dubbing(request: Request):
         if voice_url:
             speaker_wav = os.path.join(temp_dir, "sample.wav")
             try:
-                # محاولة تحميل الرابط القادم من الواجهة
-                urllib.request.urlretrieve(voice_url, speaker_wav)
+                # 🟢 تحميل الصوت متنكراً كمتصفح
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                r = requests.get(voice_url, headers=headers, timeout=15)
+                if r.status_code == 200:
+                    with open(speaker_wav, 'wb') as f:
+                        f.write(r.content)
+                else:
+                    speaker_wav = source_wav
             except Exception:
                 speaker_wav = source_wav
 
@@ -85,6 +92,7 @@ async def process_dubbing(request: Request):
 
 @web_app.post("/tts")
 async def process_tts(request: Request):
+    import requests # استدعاء المكتبة
     data = await request.json()
     raw_text = data.get("text", "")
     target_lang = data.get("lang", "en")
@@ -101,23 +109,26 @@ async def process_tts(request: Request):
         output_wav = os.path.join(temp_dir, "tts_out.wav")
         speaker_wav = None
         
-        # 🟢 إذا اختار (Voice Clone) المرفوع من جهازه
         if voice_id == "source" and sample_b64:
             speaker_wav = os.path.join(temp_dir, "clone_ref.wav")
             with open(speaker_wav, "wb") as f:
                 f.write(base64.b64decode(sample_b64))
                 
-        # 🟢 إذا اختار صوت محدد مثل (muhammad)
         elif voice_id != "source":
             speaker_wav = os.path.join(temp_dir, "github_ref.wav")
-            # استخدام الرابط الخام المباشر من مستودعك لضمان عدم حدوث خطأ 404
-            sample_url = f"https://raw.githubusercontent.com/sl-Dubbing/dubbing-studio/main/samples/{voice_id}.mp3"
+            # 🟢 سحب الصوت من رابط موقعك العام مباشرة بدلاً من المستودع الخام لتجنب الحظر
+            sample_url = f"https://sl-dubbing.github.io/samples/{voice_id}.mp3"
             try:
-                urllib.request.urlretrieve(sample_url, speaker_wav)
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                r = requests.get(sample_url, headers=headers, timeout=15)
+                if r.status_code == 200:
+                    with open(speaker_wav, 'wb') as f:
+                        f.write(r.content)
+                else:
+                    speaker_wav = None
             except:
-                speaker_wav = None # حماية من الانهيار
+                speaker_wav = None
 
-        # توليد الصوت بالمرجع أو بالصوت الافتراضي
         if speaker_wav:
             t_model.tts_to_file(text=translated_text, file_path=output_wav, speaker_wav=speaker_wav, language=target_lang)
         else:
