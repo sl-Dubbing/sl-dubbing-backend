@@ -1,35 +1,23 @@
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg build-essential libsndfile1 && \
+    apt-get install -y --no-install-recommends \
+      ffmpeg \
+      build-essential \
+      libsndfile1 \
+      libasound2 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY . /app
 
 ENV PORT=5000
-EXPOSE 5000
 
-FROM python:3.11-slim
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg build-essential libsndfile1 && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-# لا حاجة لـ ENV PORT=5000 هنا لأن Railway سيعطيك بورت تلقائياً
-# EXPOSE 5000 أيضاً غير ضرورية تماماً في Railway، يمكنك تركها أو حذفها
-
-CMD gunicorn server:app -b 0.0.0.0:$PORT --workers 1 --threads 4
+CMD ["sh", "-c", "gunicorn server:app -b 0.0.0.0:${PORT} --workers 1 --threads 4"]
