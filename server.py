@@ -18,6 +18,10 @@ import requests
 import base64
 import shutil
 
+# --- Google Auth Imports ---
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 load_dotenv()
 
 DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
@@ -199,6 +203,43 @@ def login():
     user = User.query.filter_by(email=(data.get('email') or '').strip().lower()).first()
     if not user or not user.check_password(data.get('password')): return jsonify({'success': False, 'error': 'بيانات الدخول غير صحيحة'}), 401
     return generate_auth_response(user)
+
+# --------- تمت إضافة مسارات جوجل وتسجيل الخروج هنا ---------
+@app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
+def google_login():
+    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    data = request.get_json(force=True, silent=True)
+    if not data or 'credential' not in data: return jsonify({'success': False, 'error': 'Missing credential'}), 400
+    token = data['credential']
+    try:
+        # Client ID الخاص بك
+        CLIENT_ID = "497619073475-6vjelufub8gci231ettdhmk5pv0cdde3.apps.googleusercontent.com"
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
+        email = idinfo['email']
+        name = idinfo.get('name', email.split('@')[0])
+        user = User.query.filter_by(email=email).first()
+        is_new = False
+        if not user:
+            user = User(email=email, name=name, auth_method='google', credits=50000)
+            db.session.add(user)
+            db.session.commit()
+            is_new = True
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        return generate_auth_response(user, is_new=is_new)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid Google token'}), 401
+    except Exception as e:
+        logger.error(f"Google login error: {str(e)}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
+def logout():
+    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    resp = make_response(jsonify({'success': True}))
+    resp.set_cookie('sl_auth_token', '', expires=0, httponly=True, secure=True, samesite='None')
+    return resp
+# -----------------------------------------------------------
 
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
 @require_auth
