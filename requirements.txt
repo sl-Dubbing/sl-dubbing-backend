@@ -2,35 +2,11 @@ Flask==3.0.3
 flask-cors==4.0.1
 Flask-SQLAlchemy==3.1.1
 psycopg2-binary==2.9.9
-TTS==0.22.0
-pydub==0.25.1
-deep-translator==1.11.4
-boto3==1.34.0
 python-dotenv==1.0.1
-yt-dlp==2024.4.9
 gunicorn==22.0.0
 werkzeug==3.0.3
-modelscope==1.14.0
-torchaudio==2.2.2
 google-auth==2.29.0
 PyJWT==2.8.0
 Flask-Limiter==3.7.0
-gTTS==2.4.0
-
-# --- المكتبات الجديدة المضافة لدعم الميزات الاحترافية ---
-# 1. تفريغ الصوت وتحويله إلى نص مع التوقيت (Speech-to-Text)
-openai-whisper
-
-# 2. التخزين السحابي للملفات الصوتية (موجودة في كود السيرفر الخاص بك)
-cloudinary
-
-# 3. مكتبة لتسهيل إنشاء وقراءة ملفات SRT برمجياً
-srt
-
-# 4. التعامل المتقدم مع الفيديو والصوت (اختياري ولكنه مفيد جداً مع Whisper)
-ffmpeg-python
-
-# CosyVoice placeholder - استبدل بالاسم الصحيح إن اختلف
-#cosyvoice==3.0.0
-openai==0.28.0
 requests
+cloudinary
