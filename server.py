@@ -115,73 +115,75 @@ def cloudinary_upload_with_retries(local_path, public_id, folder="sl-dubbing/aud
 
 # ----------------- Background processing (The GPU Connection) -----------------
 def process_full_workflow(payload):
-    job_id = payload.get('job_id')
-    user_id = payload.get('user_id')
-    start_ts = time.time()
+    # السطر السحري لحل مشكلة توقف المهام الخلفية وقاعدة البيانات
+    with app.app_context():
+        job_id = payload.get('job_id')
+        user_id = payload.get('user_id')
+        start_ts = time.time()
 
-    try:
-        job = DubbingJob.query.get(job_id)
-        user = User.query.get(user_id)
-        
-        yt_url = payload.get('yt_url')
-        if not yt_url:
-            raise ValueError("في الوقت الحالي، النظام يدعم روابط يوتيوب فقط.")
-
-        logger.info(f"[{job_id}] Sending request to Modal GPU Factory...")
-
-        MODAL_URL = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
-        
-        response = requests.post(MODAL_URL, json={
-            "yt_url": yt_url,
-            "lang": payload.get('lang', 'ar'),
-            "voice_mode": payload.get('voice_mode', 'xtts'),
-            "voice_url": payload.get('voice_url', ''),
-            "openai_key": os.environ.get("OPENAI_API_KEY", "")
-        }, timeout=600)
-        
-        result_data = response.json()
-        
-        if not result_data.get("success"):
-            raise Exception(f"خطأ في المصنع: {result_data.get('error')}")
-
-        logger.info(f"[{job_id}] Received processed audio from GPU!")
-        
-        audio_base64 = result_data.get("audio_base64")
-        audio_bytes = base64.b64decode(audio_base64)
-        
-        mp_path = AUDIO_DIR / f"dub_{job_id}.mp3"
-        with open(mp_path, "wb") as f:
-            f.write(audio_bytes)
-
-        if CLOUDINARY_AVAILABLE:
-            upload_resp = cloudinary_upload_with_retries(str(mp_path), public_id=f"dub_{job_id}")
-            audio_url = upload_resp.get('secure_url') or upload_resp.get('url')
-        else:
-            audio_url = f"file://{mp_path}"
-
-        job.output_url = audio_url
-        job.status = 'completed'
-        job.processing_time = time.time() - start_ts
-        job.method = payload.get('voice_mode', 'xtts')
-        db.session.add(job)
-        db.session.commit()
-        logger.info(f"[{job_id}] Completed successfully!")
-
-    except Exception as exc:
-        logger.error(f"[{job_id}] Processing failed: {exc}")
         try:
-            job = DubbingJob.query.get(job_id) if job_id else None
-            if job:
-                job.status = 'failed'
-                db.session.add(job)
-            if job and job.credits_used:
-                u = User.query.get(job.user_id)
-                if u:
-                    u.credits += job.credits_used
-                    db.session.add(CreditTransaction(user_id=u.id, transaction_type='refund', amount=job.credits_used, reason='Dubbing failed'))
+            job = DubbingJob.query.get(job_id)
+            user = User.query.get(user_id)
+            
+            yt_url = payload.get('yt_url')
+            if not yt_url:
+                raise ValueError("في الوقت الحالي، النظام يدعم روابط يوتيوب فقط.")
+
+            logger.info(f"[{job_id}] Sending request to Modal GPU Factory...")
+
+            MODAL_URL = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
+            
+            response = requests.post(MODAL_URL, json={
+                "yt_url": yt_url,
+                "lang": payload.get('lang', 'ar'),
+                "voice_mode": payload.get('voice_mode', 'xtts'),
+                "voice_url": payload.get('voice_url', ''),
+                "openai_key": os.environ.get("OPENAI_API_KEY", "")
+            }, timeout=600)
+            
+            result_data = response.json()
+            
+            if not result_data.get("success"):
+                raise Exception(f"خطأ في المصنع: {result_data.get('error')}")
+
+            logger.info(f"[{job_id}] Received processed audio from GPU!")
+            
+            audio_base64 = result_data.get("audio_base64")
+            audio_bytes = base64.b64decode(audio_base64)
+            
+            mp_path = AUDIO_DIR / f"dub_{job_id}.mp3"
+            with open(mp_path, "wb") as f:
+                f.write(audio_bytes)
+
+            if CLOUDINARY_AVAILABLE:
+                upload_resp = cloudinary_upload_with_retries(str(mp_path), public_id=f"dub_{job_id}")
+                audio_url = upload_resp.get('secure_url') or upload_resp.get('url')
+            else:
+                audio_url = f"file://{mp_path}"
+
+            job.output_url = audio_url
+            job.status = 'completed'
+            job.processing_time = time.time() - start_ts
+            job.method = payload.get('voice_mode', 'xtts')
+            db.session.add(job)
             db.session.commit()
-        except Exception:
-            db.session.rollback()
+            logger.info(f"[{job_id}] Completed successfully!")
+
+        except Exception as exc:
+            logger.error(f"[{job_id}] Processing failed: {exc}")
+            try:
+                job = DubbingJob.query.get(job_id) if job_id else None
+                if job:
+                    job.status = 'failed'
+                    db.session.add(job)
+                if job and job.credits_used:
+                    u = User.query.get(job.user_id)
+                    if u:
+                        u.credits += job.credits_used
+                        db.session.add(CreditTransaction(user_id=u.id, transaction_type='refund', amount=job.credits_used, reason='Dubbing failed'))
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
 
 # ----------------- Routes -----------------
 @app.route('/api/auth/register', methods=['POST', 'OPTIONS'])
@@ -212,7 +214,6 @@ def login():
     db.session.commit()
     return generate_auth_response(user)
 
-# === هذه هي الدالة المفقودة التي أعدناها ===
 @app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
 @limiter.limit("10 per minute")
 def google_login():
@@ -240,7 +241,6 @@ def google_login():
     except Exception as e:
         logger.error(f"Google login error: {e}")
         return jsonify({'success': False, 'error': 'Internal server error'}), 500
-# ============================================
 
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
 def logout():
