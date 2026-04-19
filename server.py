@@ -1,3 +1,4 @@
+# server.py
 import os
 import uuid
 import logging
@@ -24,7 +25,6 @@ DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# 🟢 تم إضافة النجمة للسماح لجميع النطاقات بالاتصال بدون أخطاء CORS
 ALLOWED_ORIGINS = ['*']
 AUDIO_DIR = Path('/tmp/sl_audio')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,16 +40,20 @@ if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# 🟢 تم تحديث إعدادات CORS للسماح بالاتصال
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day"], storage_uri="memory://")
 
 from models import db, User, DubbingJob, CreditTransaction
 db.init_app(app)
 
-import redis
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-redis_client = redis.from_url(REDIS_URL)
+# 🟢 الكود الذكي المضاد للتحطم (Defensive Programming)
+try:
+    import redis
+    REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+    redis_client = redis.from_url(REDIS_URL)
+except ImportError:
+    redis_client = None
+    logger.warning("مكتبة Redis غير مثبتة! السيرفر سيعمل، لكن لن يظهر النص المترجم في الواجهة.")
 
 def require_auth(f):
     @wraps(f)
@@ -122,7 +126,6 @@ def logout():
     resp.set_cookie('sl_auth_token', '', expires=0, httponly=True, secure=True, samesite='None')
     return resp
 
-# مسار الدبلجة الأساسي
 @app.route('/api/dub', methods=['POST', 'OPTIONS'])
 @require_auth
 def dub():
@@ -138,7 +141,7 @@ def dub():
     input_path = AUDIO_DIR / f"in_{job_id}_{filename}"
     media_file.save(input_path)
 
-    job = DubbingJob(id=job_id, user_id=user.id, language=request.form.get('lang', 'ar'), voice_mode=request.form.get('voice_mode', 'xtts'), credits_used=100, status='processing')
+    job = DubbingJob(id=job_id, user_id=user.id, language=request.form.get('lang', 'ar'), voice_mode=request.form.get('voice_mode', 'xtts'), credits_used=100, status='processing', method='dub')
     user.credits -= 100
     db.session.add(job); db.session.commit()
 
@@ -147,12 +150,11 @@ def dub():
         'voice_mode': job.voice_mode, 'voice_url': request.form.get('voice_url', ''),
         'file_path': str(input_path), 'filename': filename
     }
-    from tasks import process_tts # استدعاء المهمة من ملف مهام Celery (كانت تسمى هكذا في كودك)
+    from tasks import process_tts
     process_tts.delay(payload)
     
     return jsonify({'success': True, 'job_id': job_id, 'status': 'processing', 'remaining_credits': user.credits}), 200
 
-# 🌍 مسار الـ TTS الذكي الجديد
 @app.route('/api/tts', methods=['POST', 'OPTIONS'])
 @require_auth
 def tts():
@@ -172,12 +174,11 @@ def tts():
         'lang': data.get('lang', 'en'), 'voice_id': data.get('voice_id', 'source'),
         'sample_b64': data.get('sample_b64', '')
     }
-    from tasks import process_smart_tts # استدعاء المهمة الجديدة
+    from tasks import process_smart_tts
     process_smart_tts.delay(payload)
 
     return jsonify({'success': True, 'job_id': job_id, 'status': 'processing'}), 200
 
-# 📡 تتبع التقدم لصفحة الـ TTS
 @app.route('/api/progress/<job_id>', methods=['GET'])
 def get_progress(job_id):
     def generate():
@@ -189,13 +190,15 @@ def get_progress(job_id):
                     break
                 
                 progress_val = 50 if job.status == 'processing' else (100 if job.status == 'completed' else 0)
-                msg = "AI is translating and speaking..." if job.status == 'processing' else job.status
+                msg = "AI is working..." if job.status == 'processing' else job.status
 
                 final_text = ""
                 if job.status == 'completed':
                     try:
-                        f_text_bytes = redis_client.get(f"tts_text_{job_id}")
-                        if f_text_bytes: final_text = f_text_bytes.decode('utf-8')
+                        # 🟢 التحقق من وجود redis_client قبل محاولة استخدامه
+                        if redis_client:
+                            f_text_bytes = redis_client.get(f"tts_text_{job_id}")
+                            if f_text_bytes: final_text = f_text_bytes.decode('utf-8')
                     except Exception: pass
 
                 payload = {
