@@ -1,4 +1,4 @@
-# server.py - النسخة المستقرة النهائية (بدون يوتيوب)
+# server.py - النسخة الاحترافية النهائية والمستقرة
 import os
 import uuid
 import logging
@@ -24,7 +24,7 @@ from google.auth.transport import requests as google_requests
 
 load_dotenv()
 
-# إعداد السجلات بالإنجليزية لتجنب أخطاء الترميز في Terminal
+# إعداد السجلات بالإنجليزية لتجنب أخطاء الترميز ASCII في Railway Terminal
 DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day"], 
 from models import db, User, DubbingJob, CreditTransaction
 db.init_app(app)
 
-# Cloudinary Setup
+# إعداد Cloudinary للرفع السحابي
 try:
     import cloudinary
     import cloudinary.uploader
@@ -98,7 +98,7 @@ def generate_auth_response(user, is_new=False):
     resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*60*60)
     return resp
 
-# ----------------- Background processing -----------------
+# ----------------- Background processing (The GPU Factory) -----------------
 def process_full_workflow(payload):
     with app.app_context():
         job_id = payload.get('job_id')
@@ -111,14 +111,14 @@ def process_full_workflow(payload):
             file_path = payload.get('file_path')
 
             if not file_path or not os.path.exists(file_path):
-                raise ValueError("Source file missing on server.")
+                raise ValueError("Source file missing")
 
-            logger.info(f"[{job_id}] Encoding file and sending to GPU Factory...")
+            # سجلات بالإنجليزية فقط لتجنب انهيار ASCII في التيرمينال
+            logger.info(f"[{job_id}] Sending encoded file to Modal...")
 
             with open(file_path, "rb") as f:
                 file_b64 = base64.b64encode(f.read()).decode('utf-8')
 
-            # إرسال الطلب للمصنع (Modal)
             MODAL_URL = os.environ.get("MODAL_URL") or "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
             
             response = requests.post(MODAL_URL, json={
@@ -133,8 +133,9 @@ def process_full_workflow(payload):
             result_data = response.json()
             
             if not result_data.get("success"):
-                # نستخدم الإنجليزية هنا لتجنب خطأ ASCII في السجلات
-                raise Exception(f"Factory Error: {result_data.get('error')}")
+                # رسالة إنجليزية لضمان عدم حدوث Crash أثناء محاولة طباعة سجلات الخطأ
+                error_msg = result_data.get('error', 'Unknown Factory Error')
+                raise Exception(f"Factory Error: {error_msg}")
 
             audio_base64 = result_data.get("audio_base64")
             audio_bytes = base64.b64decode(audio_base64)
@@ -147,6 +148,7 @@ def process_full_workflow(payload):
                 resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/audio", public_id=f"dub_{job_id}")
                 audio_url = resp.get('secure_url') or resp.get('url')
             else:
+                # الرابط المحلي كخيار بديل في حال تعطل Cloudinary
                 audio_url = f"https://{request.host}/api/file/dub_{job_id}.mp3"
 
             job.output_url = audio_url
@@ -154,10 +156,12 @@ def process_full_workflow(payload):
             job.processing_time = time.time() - start_ts
             db.session.commit()
             
+            # تنظيف الملفات المؤقتة لتوفير المساحة
             if os.path.exists(file_path): os.remove(file_path)
             logger.info(f"[{job_id}] Processing Success!")
 
         except Exception as exc:
+            # تسجيل الخطأ تقنياً بالإنجليزية فقط
             logger.error(f"[{job_id}] Failed: {str(exc)}")
             try:
                 job = DubbingJob.query.get(job_id)
