@@ -13,6 +13,9 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+# 🔴 السطر السحري لحل مشكلة البناء (يجب أن يكون هنا قبل تثبيت المتطلبات)
+RUN pip install --upgrade pip setuptools wheel
+
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
