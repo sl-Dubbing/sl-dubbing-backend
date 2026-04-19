@@ -5,7 +5,7 @@ import os, tempfile, subprocess, base64, urllib.request, shutil
 image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg", "libasound2", "libsndfile1")
-    .run_commands("echo 'Version 7.0 - Direct Audio Links'")
+    .run_commands("echo 'Version 8.0 - Bulletproof Raw GitHub Links'")
     .pip_install(
         "fastapi", "uvicorn", "openai-whisper", "TTS", 
         "soundfile", "transformers==4.35.2", 
@@ -59,6 +59,7 @@ async def process_dubbing(request: Request):
         if voice_url:
             speaker_wav = os.path.join(temp_dir, "sample.wav")
             try:
+                # محاولة تحميل الرابط القادم من الواجهة
                 urllib.request.urlretrieve(voice_url, speaker_wav)
             except Exception:
                 speaker_wav = source_wav
@@ -100,19 +101,23 @@ async def process_tts(request: Request):
         output_wav = os.path.join(temp_dir, "tts_out.wav")
         speaker_wav = None
         
+        # 🟢 إذا اختار (Voice Clone) المرفوع من جهازه
         if voice_id == "source" and sample_b64:
             speaker_wav = os.path.join(temp_dir, "clone_ref.wav")
             with open(speaker_wav, "wb") as f:
                 f.write(base64.b64decode(sample_b64))
+                
+        # 🟢 إذا اختار صوت محدد مثل (muhammad)
         elif voice_id != "source":
-            speaker_wav = os.path.join(temp_dir, "website_ref.wav")
-            # 🟢 التعديل الأهم: جلب الصوت من رابط موقعك المباشر والمضمون
-            sample_url = f"https://sl-dubbing.github.io/samples/{voice_id}.mp3"
+            speaker_wav = os.path.join(temp_dir, "github_ref.wav")
+            # استخدام الرابط الخام المباشر من مستودعك لضمان عدم حدوث خطأ 404
+            sample_url = f"https://raw.githubusercontent.com/sl-Dubbing/dubbing-studio/main/samples/{voice_id}.mp3"
             try:
                 urllib.request.urlretrieve(sample_url, speaker_wav)
             except:
-                speaker_wav = None
+                speaker_wav = None # حماية من الانهيار
 
+        # توليد الصوت بالمرجع أو بالصوت الافتراضي
         if speaker_wav:
             t_model.tts_to_file(text=translated_text, file_path=output_wav, speaker_wav=speaker_wav, language=target_lang)
         else:
