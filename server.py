@@ -6,6 +6,7 @@ import time
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
+from threading import Thread
 from flask import Flask, request, jsonify, make_response, send_file, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -15,7 +16,10 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.utils import secure_filename
 import requests
+import base64
+import shutil
 
+# --- Google Auth Imports ---
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
@@ -46,14 +50,24 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day"], 
 from models import db, User, DubbingJob, CreditTransaction
 db.init_app(app)
 
-# 🟢 الكود الذكي المضاد للتحطم (Defensive Programming)
 try:
-    import redis
-    REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-    redis_client = redis.from_url(REDIS_URL)
-except ImportError:
-    redis_client = None
-    logger.warning("مكتبة Redis غير مثبتة! السيرفر سيعمل، لكن لن يظهر النص المترجم في الواجهة.")
+    import cloudinary
+    import cloudinary.uploader
+    if os.getenv('CLOUDINARY_NAME'):
+        cloudinary.config(
+            cloud_name=os.getenv('CLOUDINARY_NAME'),
+            api_key=os.getenv('CLOUDINARY_API_KEY'),
+            api_secret=os.getenv('CLOUDINARY_API_SECRET'),
+            secure=True
+        )
+        CLOUDINARY_AVAILABLE = True
+    else:
+        CLOUDINARY_AVAILABLE = False
+except Exception:
+    CLOUDINARY_AVAILABLE = False
+
+# 🟢 قاموس لحفظ النص المترجم في الذاكرة (بدون الحاجة لـ Redis)
+tts_extra_data = {}
 
 def require_auth(f):
     @wraps(f)
@@ -79,14 +93,130 @@ def generate_auth_response(user, is_new=False):
     resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*60*60)
     return resp
 
+# === دوال العمليات في الخلفية ===
+
+def process_full_workflow(payload):
+    with app.app_context():
+        job_id = payload.get('job_id')
+        user_id = payload.get('user_id')
+        start_ts = time.time()
+        job = None
+        try:
+            job = DubbingJob.query.get(job_id)
+            file_path = payload.get('file_path')
+
+            with open(file_path, "rb") as f:
+                file_b64 = base64.b64encode(f.read()).decode('utf-8')
+
+            MODAL_URL = os.environ.get("MODAL_URL") or "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
+            response = requests.post(MODAL_URL, json={
+                "file_b64": file_b64,
+                "filename": payload.get('filename'),
+                "lang": payload.get('lang', 'ar'),
+                "voice_mode": payload.get('voice_mode', 'xtts'),
+                "voice_url": payload.get('voice_url', ''),
+                "openai_key": os.environ.get("OPENAI_API_KEY", "")
+            }, timeout=600)
+
+            if response.status_code != 200: raise Exception(f"Modal returned status {response.status_code}")
+            result_data = response.json()
+            if not result_data.get("success"): raise Exception(f"Factory Error: {result_data.get('error')}")
+
+            audio_base64 = result_data.get("audio_base64")
+            audio_bytes = base64.b64decode(audio_base64)
+            mp_path = AUDIO_DIR / f"dub_{job_id}.mp3"
+            with open(mp_path, "wb") as f: f.write(audio_bytes)
+
+            if CLOUDINARY_AVAILABLE:
+                resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/audio", public_id=f"dub_{job_id}", overwrite=True)
+                audio_url = resp.get('secure_url') or resp.get('url')
+            else:
+                PUBLIC_HOST = os.environ.get("PUBLIC_HOST")
+                audio_url = f"https://{PUBLIC_HOST}/api/file/dub_{job_id}.mp3" if PUBLIC_HOST else f"/api/file/dub_{job_id}.mp3"
+
+            job.output_url = audio_url
+            job.status = 'completed'
+            job.processing_time = time.time() - start_ts
+            db.session.add(job); db.session.commit()
+
+            try:
+                if os.path.exists(file_path): os.remove(file_path)
+                if os.path.exists(mp_path): os.remove(mp_path)
+            except Exception: pass
+        except Exception as exc:
+            try:
+                if job:
+                    job.status = 'failed'; db.session.add(job)
+                    u = User.query.get(job.user_id)
+                    if u and job.credits_used:
+                        u.credits += job.credits_used
+                    db.session.commit()
+            except Exception: db.session.rollback()
+
+def process_tts_workflow(job_id, user_id, payload):
+    with app.app_context():
+        job = DubbingJob.query.get(job_id)
+        start_ts = time.time()
+        try:
+            MODAL_URL = os.environ.get("MODAL_URL") or "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
+            if not MODAL_URL.endswith('/'): MODAL_URL += '/'
+            tts_url = MODAL_URL + "tts"
+
+            response = requests.post(tts_url, json={
+                "text": payload.get('text'),
+                "lang": payload.get('lang', 'en'),
+                "voice_id": payload.get('voice_id', 'source'),
+                "sample_b64": payload.get('sample_b64', '')
+            }, timeout=300)
+
+            if response.status_code != 200: raise Exception(f"Modal returned status {response.status_code}")
+            result_data = response.json()
+            if not result_data.get("success"): raise Exception(f"TTS Error: {result_data.get('error')}")
+
+            audio_base64 = result_data.get("audio_base64")
+            audio_bytes = base64.b64decode(audio_base64)
+            mp_path = AUDIO_DIR / f"tts_{job_id}.mp3"
+            with open(mp_path, "wb") as f: f.write(audio_bytes)
+
+            if CLOUDINARY_AVAILABLE:
+                resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/tts", public_id=f"tts_{job_id}", overwrite=True)
+                audio_url = resp.get('secure_url') or resp.get('url')
+            else:
+                PUBLIC_HOST = os.environ.get("PUBLIC_HOST")
+                audio_url = f"https://{PUBLIC_HOST}/api/file/tts_{job_id}.mp3" if PUBLIC_HOST else f"/api/file/tts_{job_id}.mp3"
+
+            job.output_url = audio_url
+            job.status = 'completed'
+            job.processing_time = time.time() - start_ts
+            
+            # حفظ النص المترجم في الذاكرة
+            tts_extra_data[job_id] = result_data.get("final_text", "")
+            
+            db.session.add(job); db.session.commit()
+
+            try:
+                if os.path.exists(mp_path): os.remove(mp_path)
+            except Exception: pass
+        except Exception as exc:
+            try:
+                if job:
+                    job.status = 'failed'; db.session.add(job)
+                    u = User.query.get(job.user_id)
+                    if u and job.credits_used:
+                        u.credits += job.credits_used
+                    db.session.commit()
+            except Exception: db.session.rollback()
+
+# === مسارات الـ API ===
+
 @app.route('/api/auth/register', methods=['POST', 'OPTIONS'])
 def register():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
     data = request.get_json(force=True, silent=True) or {}
     email = (data.get('email') or '').strip().lower()
     password = data.get('password') or ''
-    if not email or not password: return jsonify({'success': False, 'error': 'البريد وكلمة المرور مطلوبة'}), 400
-    if User.query.filter_by(email=email).first(): return jsonify({'success': False, 'error': 'هذا البريد مسجل مسبقاً'}), 400
+    if not email or not password: return jsonify({'success': False, 'error': 'مطلوب'}), 400
+    if User.query.filter_by(email=email).first(): return jsonify({'success': False, 'error': 'مسجل مسبقاً'}), 400
     user = User(email=email, name=email.split('@')[0], auth_method='email', credits=50000)
     user.set_password(password)
     db.session.add(user); db.session.commit()
@@ -97,7 +227,7 @@ def login():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
     data = request.get_json(force=True, silent=True) or {}
     user = User.query.filter_by(email=(data.get('email') or '').strip().lower()).first()
-    if not user or not user.check_password(data.get('password')): return jsonify({'success': False, 'error': 'بيانات الدخول غير صحيحة'}), 401
+    if not user or not user.check_password(data.get('password')): return jsonify({'success': False, 'error': 'خطأ'}), 401
     return generate_auth_response(user)
 
 @app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
@@ -117,7 +247,7 @@ def google_login():
             db.session.add(user); db.session.commit(); is_new = True
         user.last_login = datetime.utcnow(); db.session.commit()
         return generate_auth_response(user, is_new=is_new)
-    except Exception: return jsonify({'success': False, 'error': 'Invalid Google token'}), 401
+    except Exception: return jsonify({'success': False, 'error': 'Token error'}), 401
 
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
 def logout():
@@ -131,7 +261,7 @@ def logout():
 def dub():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
     media_file = request.files.get('media_file')
-    if not media_file: return jsonify({'success': False, 'error': 'يرجى رفع ملف أولاً'}), 400
+    if not media_file: return jsonify({'success': False, 'error': 'Missing file'}), 400
 
     user = request.user
     if user.credits < 100: return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
@@ -150,10 +280,8 @@ def dub():
         'voice_mode': job.voice_mode, 'voice_url': request.form.get('voice_url', ''),
         'file_path': str(input_path), 'filename': filename
     }
-    from tasks import process_tts
-    process_tts.delay(payload)
-    
-    return jsonify({'success': True, 'job_id': job_id, 'status': 'processing', 'remaining_credits': user.credits}), 200
+    Thread(target=process_full_workflow, args=(payload,), daemon=True).start()
+    return jsonify({'success': True, 'job_id': job_id, 'status': 'processing'}), 200
 
 @app.route('/api/tts', methods=['POST', 'OPTIONS'])
 @require_auth
@@ -162,7 +290,7 @@ def tts():
     data = request.get_json(force=True, silent=True) or {}
     
     user = request.user
-    if user.credits < 50: return jsonify({'success': False, 'error': 'رصيدك غير كافٍ للـ TTS'}), 402
+    if user.credits < 50: return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
 
     job_id = str(uuid.uuid4())
     job = DubbingJob(id=job_id, user_id=user.id, language=data.get('lang', 'en'), voice_mode=data.get('voice_id', 'source'), credits_used=50, status='processing', method='tts')
@@ -174,9 +302,7 @@ def tts():
         'lang': data.get('lang', 'en'), 'voice_id': data.get('voice_id', 'source'),
         'sample_b64': data.get('sample_b64', '')
     }
-    from tasks import process_smart_tts
-    process_smart_tts.delay(payload)
-
+    Thread(target=process_tts_workflow, args=(job_id, user.id, payload), daemon=True).start()
     return jsonify({'success': True, 'job_id': job_id, 'status': 'processing'}), 200
 
 @app.route('/api/progress/<job_id>', methods=['GET'])
@@ -194,12 +320,7 @@ def get_progress(job_id):
 
                 final_text = ""
                 if job.status == 'completed':
-                    try:
-                        # 🟢 التحقق من وجود redis_client قبل محاولة استخدامه
-                        if redis_client:
-                            f_text_bytes = redis_client.get(f"tts_text_{job_id}")
-                            if f_text_bytes: final_text = f_text_bytes.decode('utf-8')
-                    except Exception: pass
+                    final_text = tts_extra_data.get(job_id, "")
 
                 payload = {
                     "status": "done" if job.status == 'completed' else job.status,
@@ -211,6 +332,7 @@ def get_progress(job_id):
                 yield f"data: {json.dumps(payload)}\n\n"
                 
                 if job.status in ['completed', 'failed', 'error']:
+                    if job_id in tts_extra_data: del tts_extra_data[job_id] # تفريغ الذاكرة
                     break
             time.sleep(1.5)
     return Response(generate(), mimetype='text/event-stream')
@@ -219,7 +341,7 @@ def get_progress(job_id):
 @require_auth
 def get_job(job_id):
     job = DubbingJob.query.get(job_id)
-    if not job or job.user_id != request.user.id: return jsonify({'error': 'Not found'}), 404
+    if not job: return jsonify({'error': 'Not found'}), 404
     return jsonify({
         'success': True, 'job_id': job.id, 'status': job.status, 'audio_url': job.output_url,
         'method': job.method, 'processing_time': job.processing_time, 'credits_used': job.credits_used,
