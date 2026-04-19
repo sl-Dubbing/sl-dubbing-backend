@@ -1,4 +1,4 @@
-# tasks.py (احتياطي - Celery worker)
+# tasks.py
 import os
 import time
 import logging
@@ -27,16 +27,15 @@ celery_app.conf.update(
     result_expires=3600,
 )
 
-# Cloudinary optional import
 try:
     import cloudinary
     import cloudinary.uploader
-    CLOUDINARY_AVAILABLE = True
-    CLOUDINARY_NAME = os.getenv('dxbmvzsiz')
-    CLOUDINARY_API_KEY = os.getenv('0wmWqlKFRVmqbE8lBbYDYeUQ24E')
-    CLOUDINARY_API_SECRET = os.getenv('295811796272148')
+    CLOUDINARY_NAME = os.getenv('CLOUDINARY_NAME')
+    CLOUDINARY_API_KEY = os.getenv('CLOUDINARY_API_KEY')
+    CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET')
     if CLOUDINARY_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
         cloudinary.config(cloud_name=CLOUDINARY_NAME, api_key=CLOUDINARY_API_KEY, api_secret=CLOUDINARY_API_SECRET, secure=True)
+        CLOUDINARY_AVAILABLE = True
     else:
         CLOUDINARY_AVAILABLE = False
         logger.warning("Cloudinary credentials missing; will fallback to local storage.")
@@ -76,27 +75,26 @@ def process_tts(self, payload):
     job_id = payload.get('job_id')
     user_id = payload.get('user_id')
     logger.info(f"[{job_id}] Worker started for user {user_id}")
-    
+
     with flask_app.app_context():
+        job = None
         try:
             job = DubbingJob.query.get(job_id)
             user = User.query.get(user_id)
             if not job or not user:
                 raise ValueError("Job or user not found")
-            
+
             file_path = payload.get('file_path')
             if not file_path or not os.path.exists(file_path):
                 raise ValueError("لم يتم العثور على الملف المرفوع.")
 
             logger.info(f"[{job_id}] Encoding file and sending to Modal GPU Factory via Celery...")
 
-            # قراءة الملف المرفوع وتحويله إلى Base64
             with open(file_path, "rb") as f:
                 file_b64 = base64.b64encode(f.read()).decode('utf-8')
 
-            MODAL_URL = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
-            
-            # إرسال الملف إلى المصنع
+            MODAL_URL = os.environ.get("MODAL_URL") or "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
+
             response = requests.post(MODAL_URL, json={
                 "file_b64": file_b64,
                 "filename": payload.get('filename'),
@@ -105,46 +103,53 @@ def process_tts(self, payload):
                 "voice_url": payload.get('voice_url', ''),
                 "openai_key": os.environ.get("OPENAI_API_KEY", "")
             }, timeout=600)
-            
+
+            logger.debug(f"[{job_id}] Modal status: {response.status_code}")
+            logger.debug(f"[{job_id}] Modal text: {response.text}")
+
+            if response.status_code != 200:
+                raise Exception(f"Modal returned status {response.status_code}: {response.text}")
+
             result_data = response.json()
-            
             if not result_data.get("success"):
                 raise Exception(f"خطأ في المصنع: {result_data.get('error')}")
 
-            logger.info(f"[{job_id}] Received processed audio from GPU!")
-            
             audio_base64 = result_data.get("audio_base64")
             audio_bytes = base64.b64decode(audio_base64)
-            
+
             mp_path = AUDIO_DIR / f"dub_{job_id}.mp3"
             with open(mp_path, "wb") as f:
                 f.write(audio_bytes)
 
-            # الرفع إلى Cloudinary
             if CLOUDINARY_AVAILABLE:
                 upload_resp = cloudinary_upload_with_retries(str(mp_path), public_id=f"dub_{job_id}")
                 audio_url = upload_resp.get('secure_url') or upload_resp.get('url')
             else:
-                audio_url = f"file://{mp_path}"
+                PUBLIC_HOST = os.environ.get("PUBLIC_HOST")
+                if PUBLIC_HOST:
+                    audio_url = f"https://{PUBLIC_HOST}/api/file/dub_{job_id}.mp3"
+                else:
+                    audio_url = str(mp_path)
 
-            # تحديث قاعدة البيانات بنجاح العملية
             job.output_url = audio_url
             job.status = 'completed'
             job.method = payload.get('voice_mode', 'xtts')
             db.session.add(job)
             db.session.commit()
-            
-            # تنظيف الملف الأصلي
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                
+
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                if os.path.exists(mp_path):
+                    os.remove(mp_path)
+            except Exception as e:
+                logger.warning(f"Cleanup failed: {e}")
+
             return {"status":"done", "job_id":job_id, "audio_url":audio_url}
 
         except Exception as e:
             logger.exception("Worker failed")
             try:
-                # في حال الفشل، تحديث الحالة وإرجاع الرصيد
-                job = DubbingJob.query.get(job_id) if job_id else None
                 if job:
                     job.status = 'failed'
                     db.session.add(job)
@@ -157,5 +162,5 @@ def process_tts(self, payload):
             except Exception as refund_exc:
                 logger.error(f"Refund failed: {refund_exc}")
                 db.session.rollback()
-                
+
             return {"status":"error", "job_id":job_id, "error":str(e)}
