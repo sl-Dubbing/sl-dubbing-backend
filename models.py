@@ -18,11 +18,9 @@ class User(db.Model):
     last_login = db.Column(db.DateTime, default=datetime.utcnow)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
-    # Relationships
     jobs = db.relationship('DubbingJob', backref='user', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('CreditTransaction', backref='user', lazy=True, cascade='all, delete-orphan')
 
-    # Password helpers
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
@@ -41,11 +39,14 @@ class User(db.Model):
             'auth_method': self.auth_method
         }
 
+    def __repr__(self):
+        return f"<User {self.email}>"
+
 class DubbingJob(db.Model):
     __tablename__ = 'dubbing_jobs'
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    status = db.Column(db.String(20), default='pending', index=True)  # pending, processing, completed, failed
+    status = db.Column(db.String(20), default='pending', index=True)
     language = db.Column(db.String(10), nullable=False)
     voice_mode = db.Column(db.String(50), nullable=False)
     text_length = db.Column(db.Integer, default=0)
@@ -56,11 +57,17 @@ class DubbingJob(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    def __repr__(self):
+        return f"<DubbingJob {self.id} status={self.status}>"
+
 class CreditTransaction(db.Model):
     __tablename__ = 'credit_transactions'
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid4()))
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    transaction_type = db.Column(db.String(20), nullable=False)  # usage, refund, topup
+    transaction_type = db.Column(db.String(20), nullable=False)
     amount = db.Column(db.Integer, nullable=False)
     reason = db.Column(db.String(200), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def __repr__(self):
+        return f"<CreditTransaction {self.id} {self.transaction_type} {self.amount}>"
