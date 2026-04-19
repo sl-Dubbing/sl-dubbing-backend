@@ -13,6 +13,7 @@ import jwt
 from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from werkzeug.utils import secure_filename
 
 import requests
 import base64
@@ -115,7 +116,6 @@ def cloudinary_upload_with_retries(local_path, public_id, folder="sl-dubbing/aud
 
 # ----------------- Background processing (The GPU Connection) -----------------
 def process_full_workflow(payload):
-    # السطر السحري لحل مشكلة توقف المهام الخلفية وقاعدة البيانات
     with app.app_context():
         job_id = payload.get('job_id')
         user_id = payload.get('user_id')
@@ -125,16 +125,23 @@ def process_full_workflow(payload):
             job = DubbingJob.query.get(job_id)
             user = User.query.get(user_id)
             
-            yt_url = payload.get('yt_url')
-            if not yt_url:
-                raise ValueError("في الوقت الحالي، النظام يدعم روابط يوتيوب فقط.")
+            # 1. التأكد من وجود الملف المرفوع بدلاً من رابط يوتيوب
+            file_path = payload.get('file_path')
+            if not file_path or not os.path.exists(file_path):
+                raise ValueError("لم يتم العثور على الملف المرفوع.")
 
-            logger.info(f"[{job_id}] Sending request to Modal GPU Factory...")
+            logger.info(f"[{job_id}] Encoding file and sending to Modal GPU Factory...")
+
+            # 2. قراءة الملف وتحويله إلى Base64 لإرساله عبر الإنترنت
+            with open(file_path, "rb") as f:
+                file_b64 = base64.b64encode(f.read()).decode('utf-8')
 
             MODAL_URL = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
             
+            # 3. إرسال الملف إلى Modal
             response = requests.post(MODAL_URL, json={
-                "yt_url": yt_url,
+                "file_b64": file_b64,
+                "filename": payload.get('filename'),
                 "lang": payload.get('lang', 'ar'),
                 "voice_mode": payload.get('voice_mode', 'xtts'),
                 "voice_url": payload.get('voice_url', ''),
@@ -167,6 +174,11 @@ def process_full_workflow(payload):
             job.method = payload.get('voice_mode', 'xtts')
             db.session.add(job)
             db.session.commit()
+            
+            # 4. مسح الملف الأصلي من سيرفر Railway لتوفير المساحة
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
             logger.info(f"[{job_id}] Completed successfully!")
 
         except Exception as exc:
@@ -254,16 +266,28 @@ def logout():
 @limiter.limit("5 per minute")
 def dub():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    
+    # استقبال الملف المرفوع بدلاً من الرابط
+    media_file = request.files.get('media_file')
+    if not media_file or media_file.filename == '':
+        return jsonify({'success': False, 'error': 'يرجى رفع ملف صوت أو فيديو'}), 400
+
     lang = request.form.get('lang', 'ar')
     voice_mode = request.form.get('voice_mode', 'xtts')
     voice_id = request.form.get('voice_id', '')
     voice_url = request.form.get('voice_url', '')
-    yt_url = request.form.get('yt_url', '').strip()
-    if not yt_url: return jsonify({'success': False, 'error': 'يرجى تقديم رابط يوتيوب'}), 400
+    
     user = request.user
     processing_cost = 100 
     if user.credits < processing_cost: return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
+    
     job_id = str(uuid.uuid4())
+    
+    # حفظ الملف مؤقتاً في سيرفر Railway
+    filename = secure_filename(media_file.filename)
+    input_path = AUDIO_DIR / f"in_{job_id}_{filename}"
+    media_file.save(input_path)
+
     try:
         user.credits -= processing_cost
         db.session.add(CreditTransaction(user_id=user.id, transaction_type='usage', amount=-processing_cost, reason='Processing Fee'))
@@ -273,6 +297,7 @@ def dub():
     except Exception:
         db.session.rollback()
         return jsonify({'success': False, 'error': 'Internal DB error'}), 500
+        
     payload = {
         'job_id': job_id,
         'user_id': user.id,
@@ -280,7 +305,8 @@ def dub():
         'voice_mode': voice_mode,
         'voice_id': voice_id,
         'voice_url': voice_url,
-        'yt_url': yt_url
+        'file_path': str(input_path),
+        'filename': filename
     }
     t = Thread(target=process_full_workflow, args=(payload,), daemon=True)
     t.start()
