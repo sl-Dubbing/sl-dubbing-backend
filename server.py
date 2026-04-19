@@ -125,21 +125,19 @@ def process_full_workflow(payload):
         
         yt_url = payload.get('yt_url')
         if not yt_url:
-            raise ValueError("في الوقت الحالي، النظام يدعم روابط يوتيوب فقط. جاري دعم رفع الملفات قريباً.")
+            raise ValueError("في الوقت الحالي، النظام يدعم روابط يوتيوب فقط.")
 
         logger.info(f"[{job_id}] Sending request to Modal GPU Factory...")
 
-        # رابط مصنعك السري الخارق في Modal
         MODAL_URL = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run"
         
-        # إرسال البيانات للمصنع
         response = requests.post(MODAL_URL, json={
             "yt_url": yt_url,
             "lang": payload.get('lang', 'ar'),
             "voice_mode": payload.get('voice_mode', 'xtts'),
             "voice_url": payload.get('voice_url', ''),
             "openai_key": os.environ.get("OPENAI_API_KEY", "")
-        }, timeout=600) # نعطيه 10 دقائق كحد أقصى للرد
+        }, timeout=600)
         
         result_data = response.json()
         
@@ -148,7 +146,6 @@ def process_full_workflow(payload):
 
         logger.info(f"[{job_id}] Received processed audio from GPU!")
         
-        # استلام الصوت المزدبلج وتحويله لملف حقيقي
         audio_base64 = result_data.get("audio_base64")
         audio_bytes = base64.b64decode(audio_base64)
         
@@ -156,14 +153,12 @@ def process_full_workflow(payload):
         with open(mp_path, "wb") as f:
             f.write(audio_bytes)
 
-        # رفع الملف للسحابة (Cloudinary)
         if CLOUDINARY_AVAILABLE:
             upload_resp = cloudinary_upload_with_retries(str(mp_path), public_id=f"dub_{job_id}")
             audio_url = upload_resp.get('secure_url') or upload_resp.get('url')
         else:
             audio_url = f"file://{mp_path}"
 
-        # تحديث قاعدة البيانات
         job.output_url = audio_url
         job.status = 'completed'
         job.processing_time = time.time() - start_ts
@@ -192,7 +187,6 @@ def process_full_workflow(payload):
 @app.route('/api/auth/register', methods=['POST', 'OPTIONS'])
 @limiter.limit("10 per minute")
 def register():
-    # ... (كود التسجيل بقي كما هو) ...
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
     data = request.get_json(force=True, silent=True)
     email = (data.get('email') or '').strip().lower()
@@ -218,6 +212,36 @@ def login():
     db.session.commit()
     return generate_auth_response(user)
 
+# === هذه هي الدالة المفقودة التي أعدناها ===
+@app.route('/api/auth/google', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def google_login():
+    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    data = request.get_json(force=True, silent=True)
+    if not data or 'credential' not in data: return jsonify({'success': False, 'error': 'Missing credential'}), 400
+    token = data['credential']
+    try:
+        CLIENT_ID = "497619073475-6vjelufub8gci231ettdhmk5pv0cdde3.apps.googleusercontent.com"
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
+        email = idinfo['email']
+        name = idinfo.get('name', email.split('@')[0])
+        user = User.query.filter_by(email=email).first()
+        is_new = False
+        if not user:
+            user = User(email=email, name=name, auth_method='google', credits=50000)
+            db.session.add(user)
+            db.session.commit()
+            is_new = True
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        return generate_auth_response(user, is_new=is_new)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid Google token'}), 401
+    except Exception as e:
+        logger.error(f"Google login error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+# ============================================
+
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
 def logout():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
@@ -230,23 +254,16 @@ def logout():
 @limiter.limit("5 per minute")
 def dub():
     if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
-
     lang = request.form.get('lang', 'ar')
     voice_mode = request.form.get('voice_mode', 'xtts')
     voice_id = request.form.get('voice_id', '')
     voice_url = request.form.get('voice_url', '')
     yt_url = request.form.get('yt_url', '').strip()
-
-    if not yt_url:
-        return jsonify({'success': False, 'error': 'يرجى تقديم رابط يوتيوب'}), 400
-
+    if not yt_url: return jsonify({'success': False, 'error': 'يرجى تقديم رابط يوتيوب'}), 400
     user = request.user
     processing_cost = 100 
-    if user.credits < processing_cost:
-         return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
-
+    if user.credits < processing_cost: return jsonify({'success': False, 'error': 'رصيدك غير كافٍ'}), 402
     job_id = str(uuid.uuid4())
-    
     try:
         user.credits -= processing_cost
         db.session.add(CreditTransaction(user_id=user.id, transaction_type='usage', amount=-processing_cost, reason='Processing Fee'))
@@ -256,7 +273,6 @@ def dub():
     except Exception:
         db.session.rollback()
         return jsonify({'success': False, 'error': 'Internal DB error'}), 500
-
     payload = {
         'job_id': job_id,
         'user_id': user.id,
@@ -266,34 +282,22 @@ def dub():
         'voice_url': voice_url,
         'yt_url': yt_url
     }
-
     t = Thread(target=process_full_workflow, args=(payload,), daemon=True)
     t.start()
-
     return jsonify({'success': True, 'job_id': job_id, 'status': 'processing', 'remaining_credits': user.credits}), 200
 
 @app.route('/api/job/<job_id>', methods=['GET'])
 @require_auth
 def get_job(job_id):
     job = DubbingJob.query.get(job_id)
-    if not job or job.user_id != request.user.id:
-        return jsonify({'success': False, 'error': 'Job not found'}), 404
-
+    if not job or job.user_id != request.user.id: return jsonify({'success': False, 'error': 'Job not found'}), 404
     audio_url = job.output_url
     if audio_url and audio_url.startswith('file://'):
         local_path = audio_url[len('file://'):]
         p = Path(local_path)
         if p.exists(): audio_url = f"https://{request.host}/api/file/{p.name}"
         else: audio_url = None
-
-    return jsonify({
-        'success': True,
-        'job_id': job.id,
-        'status': job.status,
-        'audio_url': audio_url,
-        'processing_time': job.processing_time,
-        'remaining_credits': request.user.credits
-    }), 200
+    return jsonify({'success': True, 'job_id': job.id, 'status': job.status, 'audio_url': audio_url, 'processing_time': job.processing_time, 'remaining_credits': request.user.credits}), 200
 
 @app.route('/api/user', methods=['GET'])
 @require_auth
