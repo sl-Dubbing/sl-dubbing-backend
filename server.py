@@ -15,6 +15,7 @@ from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix  # 🟢 مهم جداً لحل مشاكل الكوكيز في Railway
 import requests
 import base64
 import shutil
@@ -29,11 +30,21 @@ DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-ALLOWED_ORIGINS = ['*']
+# 🟢 التحديث الأهم: تحديد رابط موقعك صراحة بدلاً من النجمة لمنع خطأ CORS
+ALLOWED_ORIGINS = [
+    'https://sl-dubbing.github.io',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500'
+]
+
 AUDIO_DIR = Path('/tmp/sl_audio')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
+
+# 🟢 إخبار Flask بأنه يعمل خلف وكيل (Railway) لكي تعمل الكوكيز الآمنة بشكل صحيح
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 app.config['DEBUG'] = DEBUG
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or "sl-super-secret-key-123"
 
@@ -44,7 +55,8 @@ if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+# 🟢 تطبيق إعدادات CORS الصحيحة
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day"], storage_uri="memory://")
 
 from models import db, User, DubbingJob, CreditTransaction
@@ -66,7 +78,6 @@ try:
 except Exception:
     CLOUDINARY_AVAILABLE = False
 
-# 🟢 قاموس لحفظ النص المترجم في الذاكرة (بدون الحاجة لـ Redis)
 tts_extra_data = {}
 
 def require_auth(f):
@@ -90,6 +101,7 @@ def generate_auth_response(user, is_new=False):
         'iat': datetime.utcnow(), 'exp': datetime.utcnow() + timedelta(hours=24)
     }, app.config['SECRET_KEY'], algorithm='HS256')
     resp = make_response(jsonify({'success': True, 'user': user.to_dict(), 'is_new': is_new}))
+    # إعدادات الكوكيز الصارمة للربط بين النطاقات
     resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*60*60)
     return resp
 
@@ -116,23 +128,28 @@ def process_full_workflow(payload):
                 "voice_mode": payload.get('voice_mode', 'xtts'),
                 "voice_url": payload.get('voice_url', ''),
                 "openai_key": os.environ.get("OPENAI_API_KEY", "")
-            }, timeout=600)
+            }, timeout=1800) # رفعنا المهلة لتطابق تحديث Modal
 
             if response.status_code != 200: raise Exception(f"Modal returned status {response.status_code}")
             result_data = response.json()
             if not result_data.get("success"): raise Exception(f"Factory Error: {result_data.get('error')}")
 
-            audio_base64 = result_data.get("audio_base64")
-            audio_bytes = base64.b64decode(audio_base64)
-            mp_path = AUDIO_DIR / f"dub_{job_id}.mp3"
-            with open(mp_path, "wb") as f: f.write(audio_bytes)
-
-            if CLOUDINARY_AVAILABLE:
-                resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/audio", public_id=f"dub_{job_id}", overwrite=True)
-                audio_url = resp.get('secure_url') or resp.get('url')
+            # 🟢 التحديث الجديد: الاعتماد على رابط Google Cloud من Modal إذا وجد
+            if "audio_url" in result_data:
+                audio_url = result_data["audio_url"]
             else:
-                PUBLIC_HOST = os.environ.get("PUBLIC_HOST")
-                audio_url = f"https://{PUBLIC_HOST}/api/file/dub_{job_id}.mp3" if PUBLIC_HOST else f"/api/file/dub_{job_id}.mp3"
+                # خطة بديلة إذا رجع Modal Base64 القديم
+                audio_base64 = result_data.get("audio_base64")
+                audio_bytes = base64.b64decode(audio_base64)
+                mp_path = AUDIO_DIR / f"dub_{job_id}.mp3"
+                with open(mp_path, "wb") as f: f.write(audio_bytes)
+
+                if CLOUDINARY_AVAILABLE:
+                    resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/audio", public_id=f"dub_{job_id}", overwrite=True)
+                    audio_url = resp.get('secure_url') or resp.get('url')
+                else:
+                    PUBLIC_HOST = os.environ.get("PUBLIC_HOST")
+                    audio_url = f"https://{PUBLIC_HOST}/api/file/dub_{job_id}.mp3" if PUBLIC_HOST else f"/api/file/dub_{job_id}.mp3"
 
             job.output_url = audio_url
             job.status = 'completed'
@@ -141,7 +158,6 @@ def process_full_workflow(payload):
 
             try:
                 if os.path.exists(file_path): os.remove(file_path)
-                if os.path.exists(mp_path): os.remove(mp_path)
             except Exception: pass
         except Exception as exc:
             try:
@@ -167,36 +183,35 @@ def process_tts_workflow(job_id, user_id, payload):
                 "lang": payload.get('lang', 'en'),
                 "voice_id": payload.get('voice_id', 'source'),
                 "sample_b64": payload.get('sample_b64', '')
-            }, timeout=300)
+            }, timeout=1800)
 
             if response.status_code != 200: raise Exception(f"Modal returned status {response.status_code}")
             result_data = response.json()
             if not result_data.get("success"): raise Exception(f"TTS Error: {result_data.get('error')}")
 
-            audio_base64 = result_data.get("audio_base64")
-            audio_bytes = base64.b64decode(audio_base64)
-            mp_path = AUDIO_DIR / f"tts_{job_id}.mp3"
-            with open(mp_path, "wb") as f: f.write(audio_bytes)
-
-            if CLOUDINARY_AVAILABLE:
-                resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/tts", public_id=f"tts_{job_id}", overwrite=True)
-                audio_url = resp.get('secure_url') or resp.get('url')
+            # 🟢 التحديث الجديد: أخذ الرابط الجاهز من Google Cloud (Modal)
+            if "audio_url" in result_data:
+                audio_url = result_data["audio_url"]
             else:
-                PUBLIC_HOST = os.environ.get("PUBLIC_HOST")
-                audio_url = f"https://{PUBLIC_HOST}/api/file/tts_{job_id}.mp3" if PUBLIC_HOST else f"/api/file/tts_{job_id}.mp3"
+                audio_base64 = result_data.get("audio_base64")
+                audio_bytes = base64.b64decode(audio_base64)
+                mp_path = AUDIO_DIR / f"tts_{job_id}.mp3"
+                with open(mp_path, "wb") as f: f.write(audio_bytes)
+
+                if CLOUDINARY_AVAILABLE:
+                    resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/tts", public_id=f"tts_{job_id}", overwrite=True)
+                    audio_url = resp.get('secure_url') or resp.get('url')
+                else:
+                    PUBLIC_HOST = os.environ.get("PUBLIC_HOST")
+                    audio_url = f"https://{PUBLIC_HOST}/api/file/tts_{job_id}.mp3" if PUBLIC_HOST else f"/api/file/tts_{job_id}.mp3"
 
             job.output_url = audio_url
             job.status = 'completed'
             job.processing_time = time.time() - start_ts
             
-            # حفظ النص المترجم في الذاكرة
             tts_extra_data[job_id] = result_data.get("final_text", "")
             
             db.session.add(job); db.session.commit()
-
-            try:
-                if os.path.exists(mp_path): os.remove(mp_path)
-            except Exception: pass
         except Exception as exc:
             try:
                 if job:
@@ -332,7 +347,7 @@ def get_progress(job_id):
                 yield f"data: {json.dumps(payload)}\n\n"
                 
                 if job.status in ['completed', 'failed', 'error']:
-                    if job_id in tts_extra_data: del tts_extra_data[job_id] # تفريغ الذاكرة
+                    if job_id in tts_extra_data: del tts_extra_data[job_id]
                     break
             time.sleep(1.5)
     return Response(generate(), mimetype='text/event-stream')
