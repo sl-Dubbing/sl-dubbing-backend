@@ -1,10 +1,5 @@
-# server.py — النسخة النهائية الموثوقة لربط Cloudinary
-import os
-import uuid
-import logging
-import time
-import json
-import threading
+# server.py — النسخة المستقرة جداً (V20.0)
+import os, uuid, logging, time, json, threading, requests, base64
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -13,16 +8,10 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import jwt
 from functools import wraps
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
-import requests
-import base64
 
 load_dotenv()
-
-# إعدادات التسجيل لمراقبة الأخطاء في Railway Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -32,7 +21,7 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-secret-key-2026')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-secret-2026')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -41,74 +30,46 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credenti
 from models import db, User, DubbingJob
 db.init_app(app)
 
-# 🟢 إعداد Cloudinary (تأكدي من إضافة المتغيرات في Railway)
 import cloudinary
 import cloudinary.api
 try:
-    if os.getenv('CLOUDINARY_NAME'):
-        cloudinary.config(
-            cloud_name=os.getenv('CLOUDINARY_NAME'),
-            api_key=os.getenv('CLOUDINARY_API_KEY'),
-            api_secret=os.getenv('CLOUDINARY_API_SECRET'),
-            secure=True
-        )
-        CLOUDINARY_READY = True
-        logger.info("Cloudinary is configured and ready.")
-    else:
-        CLOUDINARY_READY = False
-        logger.warning("Cloudinary environment variables are missing!")
-except Exception as e:
+    cloudinary.config(
+        cloud_name=os.getenv('CLOUDINARY_NAME'),
+        api_key=os.getenv('CLOUDINARY_API_KEY'),
+        api_secret=os.getenv('CLOUDINARY_API_SECRET'),
+        secure=True
+    )
+    CLOUDINARY_READY = True
+except:
     CLOUDINARY_READY = False
-    logger.error(f"Cloudinary Config Error: {e}")
 
 _executor = ThreadPoolExecutor(max_workers=5)
 
-# ============================================================
-# 🟢 نقطة النهاية لجلب الأصوات (Auto-Sync)
-# ============================================================
+# 🟢 جلب الأصوات مع نظام حماية من الانهيار
 @app.route('/api/voices', methods=['GET'])
 def list_voices():
     voices = []
-    
-    # محاولة الجلب من Cloudinary
     if CLOUDINARY_READY:
         try:
-            # ملاحظة: الملفات الصوتية في Admin API تُطلب بـ resource_type="video"
-            result = cloudinary.api.resources(
-                type="upload",
-                prefix="sl_voices/",
-                resource_type="video"
-            )
+            result = cloudinary.api.resources(type="upload", prefix="sl_voices/", resource_type="video")
             for res in result.get('resources', []):
-                # استخراج اسم الملف بدون المسار
-                clean_name = res['public_id'].split('/')[-1]
-                voices.append({
-                    "name": clean_name,
-                    "url": res['secure_url']
-                })
+                voices.append({"name": res['public_id'].split('/')[-1], "url": res['secure_url']})
         except Exception as e:
-            logger.error(f"Failed to fetch from Cloudinary API: {e}")
-
-    # 🟢 إذا فشل كلاوديناري أو كان فارغاً، نعرض أصواتاً افتراضية لكي لا تتعطل الواجهة
+            logger.error(f"Cloudinary Error: {e}")
+    
+    # أصوات احتياطية تظهر فوراً إذا فشل الاتصال بكلاوديناري
     if not voices:
-        logger.info("No voices found in Cloudinary, providing defaults.")
-        voices = [
-            {"name": "muhammad_ar (Default)", "url": "https://res.cloudinary.com/dxbmvzsiz/video/upload/v1712611200/sl_voices/muhammad_ar.wav"},
-            {"name": "adam_ar (Backup)", "url": ""}
-        ]
-
+        voices = [{"name": "muhammad_ar", "url": "https://res.cloudinary.com/dxbmvzsiz/video/upload/v1712611200/sl_voices/muhammad_ar.wav"}]
+    
     return jsonify({"success": True, "voices": voices})
 
-# ============================================================
-# مسارات العمليات والمصادقة
-# ============================================================
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        if request.method == 'OPTIONS': return f(*args, **kwargs)
         token = request.cookies.get('sl_auth_token')
         if not token: return jsonify({'error': 'Unauthorized'}), 401
         try:
-            import jwt
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
             user = User.query.get(data.get('user_id'))
             if not user: raise ValueError()
@@ -122,29 +83,28 @@ def _run_workflow(job_id, modal_url, payload):
         job = DubbingJob.query.get(job_id)
         try:
             response = requests.post(modal_url, json=payload, timeout=1800)
-            res_data = response.json()
-            if res_data.get("success"):
-                job.output_url = res_data.get("audio_url")
+            res = response.json()
+            if res.get("success"):
+                job.output_url = res.get("audio_url")
                 job.status = 'completed'
-            else:
-                job.status = 'failed'
-        except Exception:
-            job.status = 'failed'
+                if res.get("final_text"): job.extra_data = res.get("final_text")
+            else: job.status = 'failed'
+        except: job.status = 'failed'
         db.session.commit()
 
-@app.route('/api/dub', methods=['POST'])
+@app.route('/api/dub', methods=['POST', 'OPTIONS'])
 @require_auth
 def dub():
+    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
     media_file = request.files.get('media_file')
-    user = request.user
-    if user.credits < 100: return jsonify({'error': 'No credits'}), 402
+    if not media_file: return jsonify({'error': 'No file'}), 400
     
+    user = request.user
     job_id = str(uuid.uuid4())
     input_path = AUDIO_DIR / f"in_{job_id}_{secure_filename(media_file.filename)}"
     media_file.save(input_path)
 
-    job = DubbingJob(id=job_id, user_id=user.id, status='processing', credits_used=100)
-    user.credits -= 100
+    job = DubbingJob(id=job_id, user_id=user.id, status='processing', credits_used=0)
     db.session.add(job); db.session.commit()
 
     with open(input_path, "rb") as f: file_b64 = base64.b64encode(f.read()).decode('utf-8')
@@ -163,11 +123,23 @@ def dub():
 @require_auth
 def get_job(job_id):
     job = DubbingJob.query.get(job_id)
+    if not job: return jsonify({'error': 'Not found'}), 404
     return jsonify({'status': job.status, 'audio_url': job.output_url})
 
 @app.route('/api/user')
 @require_auth
 def get_user(): return jsonify({'success': True, 'user': request.user.to_dict()})
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.json
+    user = User.query.filter_by(email=data.get('email')).first()
+    if user and user.check_password(data.get('password')):
+        token = jwt.encode({'user_id': user.id, 'exp': datetime.utcnow() + timedelta(hours=24)}, app.config['SECRET_KEY'], algorithm='HS256')
+        resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
+        resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*3600)
+        return resp
+    return jsonify({'error': 'Invalid'}), 401
 
 if __name__ == '__main__':
     with app.app_context(): db.create_all()
