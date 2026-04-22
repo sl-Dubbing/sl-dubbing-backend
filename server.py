@@ -1,4 +1,4 @@
-# server.py — النسخة المستقرة جداً (V20.0)
+# server.py — النسخة V20.0 المستقرة
 import os, uuid, logging, time, json, threading, requests, base64
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -45,7 +45,6 @@ except:
 
 _executor = ThreadPoolExecutor(max_workers=5)
 
-# 🟢 جلب الأصوات مع نظام حماية من الانهيار
 @app.route('/api/voices', methods=['GET'])
 def list_voices():
     voices = []
@@ -57,7 +56,6 @@ def list_voices():
         except Exception as e:
             logger.error(f"Cloudinary Error: {e}")
     
-    # أصوات احتياطية تظهر فوراً إذا فشل الاتصال بكلاوديناري
     if not voices:
         voices = [{"name": "muhammad_ar", "url": "https://res.cloudinary.com/dxbmvzsiz/video/upload/v1712611200/sl_voices/muhammad_ar.wav"}]
     
