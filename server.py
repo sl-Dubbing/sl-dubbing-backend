@@ -1,12 +1,10 @@
-# server.py — V21.0 الفائق الاستقرار
-import os, uuid, logging, time, json, threading, requests, base64
+import os, uuid, logging, requests, base64, jwt
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request, jsonify, make_response, send_file, Response
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
-import jwt
 from functools import wraps
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -15,6 +13,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# الإعدادات
 ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500']
 AUDIO_DIR = Path('/tmp/sl_audio')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,10 +29,16 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credenti
 from models import db, User, DubbingJob
 db.init_app(app)
 
+# Cloudinary
 import cloudinary
 import cloudinary.api
 try:
-    cloudinary.config(cloud_name=os.getenv('CLOUDINARY_NAME'), api_key=os.getenv('CLOUDINARY_API_KEY'), api_secret=os.getenv('CLOUDINARY_API_SECRET'), secure=True)
+    cloudinary.config(
+        cloud_name=os.getenv('CLOUDINARY_NAME'),
+        api_key=os.getenv('CLOUDINARY_API_KEY'),
+        api_secret=os.getenv('CLOUDINARY_API_SECRET'),
+        secure=True
+    )
     CLOUDINARY_READY = True
 except: CLOUDINARY_READY = False
 
@@ -44,9 +49,13 @@ def list_voices():
     voices = []
     if CLOUDINARY_READY:
         try:
+            # البحث في مجلد sl_voices
             result = cloudinary.api.resources(type="upload", prefix="sl_voices/", resource_type="video")
             for res in result.get('resources', []):
-                voices.append({"name": res['public_id'].split('/')[-1], "url": res['secure_url']})
+                voices.append({
+                    "name": res['public_id'].split('/')[-1],
+                    "url": res['secure_url']
+                })
         except: pass
     if not voices:
         voices = [{"name": "muhammad_ar", "url": "https://res.cloudinary.com/dxbmvzsiz/video/upload/v1712611200/sl_voices/muhammad_ar.wav"}]
@@ -55,22 +64,22 @@ def list_voices():
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if request.method == 'OPTIONS': return f(*args, **kwargs)
         token = request.cookies.get('sl_auth_token')
         if not token: return jsonify({'error': 'Unauthorized'}), 401
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            user = User.query.get(data.get('user_id'))
-            request.user = user
+            request.user = User.query.get(data.get('user_id'))
         except: return jsonify({'error': 'Session expired'}), 401
         return f(*args, **kwargs)
     return decorated_function
 
-def _run_workflow(job_id, modal_url, payload):
+def _run_workflow(job_id, payload):
     with app.app_context():
         job = DubbingJob.query.get(job_id)
         try:
-            response = requests.post(modal_url, json=payload, timeout=1800)
+            # الإرسال لـ Modal
+            factory_url = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
+            response = requests.post(factory_url, json=payload, timeout=1800)
             res = response.json()
             if res.get("success"):
                 job.output_url = res.get("audio_url")
@@ -79,23 +88,31 @@ def _run_workflow(job_id, modal_url, payload):
         except: job.status = 'failed'
         db.session.commit()
 
-@app.route('/api/dub', methods=['POST', 'OPTIONS'])
+@app.route('/api/dub', methods=['POST'])
 @require_auth
 def dub():
-    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
-    try:
-        media_file = request.files.get('media_file')
-        user = request.user
-        job_id = str(uuid.uuid4())
-        input_path = AUDIO_DIR / f"in_{job_id}.mp4"
-        media_file.save(input_path)
-        job = DubbingJob(id=job_id, user_id=user.id, status='processing', credits_used=0)
-        db.session.add(job); db.session.commit()
-        with open(input_path, "rb") as f: file_b64 = base64.b64encode(f.read()).decode('utf-8')
-        payload = {"file_b64": file_b64, "lang": request.form.get('lang', 'ar'), "voice_url": request.form.get('voice_url', '')}
-        _executor.submit(_run_workflow, job_id, "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/", payload)
-        return jsonify({'success': True, 'job_id': job_id}), 200
-    except Exception as e: return jsonify({'success': False, 'error': str(e)}), 500
+    media_file = request.files.get('media_file')
+    user = request.user
+    if not media_file: return jsonify({'error': 'No file'}), 400
+    
+    job_id = str(uuid.uuid4())
+    input_path = AUDIO_DIR / f"in_{job_id}.mp4"
+    media_file.save(input_path)
+
+    job = DubbingJob(id=job_id, user_id=user.id, status='processing', credits_used=0)
+    db.session.add(job); db.session.commit()
+
+    with open(input_path, "rb") as f:
+        file_b64 = base64.b64encode(f.read()).decode('utf-8')
+
+    payload = {
+        "file_b64": file_b64,
+        "lang": request.form.get('lang', 'ar'),
+        "voice_url": request.form.get('voice_url', '')
+    }
+    
+    _executor.submit(_run_workflow, job_id, payload)
+    return jsonify({'success': True, 'job_id': job_id})
 
 @app.route('/api/job/<job_id>')
 @require_auth
@@ -105,18 +122,8 @@ def get_job(job_id):
 
 @app.route('/api/user')
 @require_auth
-def get_user(): return jsonify({'success': True, 'user': request.user.to_dict()})
-
-@app.route('/api/auth/login', methods=['POST'])
-def login():
-    data = request.json
-    user = User.query.filter_by(email=data.get('email')).first()
-    if user and user.check_password(data.get('password')):
-        token = jwt.encode({'user_id': user.id, 'exp': datetime.utcnow() + timedelta(hours=24)}, app.config['SECRET_KEY'], algorithm='HS256')
-        resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
-        resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*3600)
-        return resp
-    return jsonify({'error': 'Invalid'}), 401
+def get_user():
+    return jsonify({'success': True, 'user': request.user.to_dict()})
 
 if __name__ == '__main__':
     with app.app_context(): db.create_all()
