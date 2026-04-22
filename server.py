@@ -1,4 +1,4 @@
-# server.py — النسخة النهائية المتوافقة مع Cloudinary
+# server.py — النسخة النهائية الكاملة والآمنة
 import os
 import uuid
 import logging
@@ -25,17 +25,15 @@ from google.auth.transport import requests as google_requests
 
 load_dotenv()
 
-# ============================================================
-# إعداد التطبيق
-# ============================================================
 DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-_secret = os.environ.get('SECRET_KEY', 'sl-secret-key-2026')
+# الإعدادات الأساسية
+_secret = os.environ.get('SECRET_KEY', 'sl-prod-key-2026')
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500']
 
-ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500', 'http://127.0.0.1:5500']
 AUDIO_DIR = Path('/tmp/sl_audio')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -46,12 +44,12 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', '').repla
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
-limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day"], storage_uri="memory://")
+limiter = Limiter(get_remote_address, app=app, default_limits=["2000 per day"], storage_uri="memory://")
 
 from models import db, User, DubbingJob
 db.init_app(app)
 
-# إعداد Cloudinary
+# إعدادات Cloudinary
 import cloudinary
 import cloudinary.api
 import cloudinary.uploader
@@ -72,34 +70,23 @@ _executor = ThreadPoolExecutor(max_workers=5)
 # 🟢 ميزة الجلب التلقائي من Cloudinary (مجلد sl_voices)
 # ============================================================
 @app.route('/api/voices', methods=['GET'])
-def list_cloudinary_voices():
-    if not CLOUDINARY_AVAILABLE:
-        return jsonify({"success": False, "error": "Cloudinary configuration missing"}), 500
+def list_voices():
+    if not CLOUDINARY_AVAILABLE: return jsonify({"success": False}), 500
     try:
-        # جلب الملفات من المجلد sl_voices (يتم تصنيف الصوت كـ video في API كلاوديناري)
-        result = cloudinary.api.resources(
-            type="upload",
-            prefix="sl_voices/",
-            resource_type="video"
-        )
-        
+        # البحث عن ملفات الصوت (المصنفة كـ video) في مجلد sl_voices
+        result = cloudinary.api.resources(type="upload", prefix="sl_voices/", resource_type="video")
         voices = []
         for res in result.get('resources', []):
-            # تنظيف الاسم (إزالة اسم المجلد والامتداد)
-            raw_id = res['public_id']
-            display_name = raw_id.replace('sl_voices/', '')
-            
             voices.append({
-                "name": display_name,
+                "name": res['public_id'].split('/')[-1],
                 "url": res['secure_url']
             })
         return jsonify({"success": True, "voices": voices})
     except Exception as e:
-        logger.error(f"Cloudinary Error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ============================================================
-# أنظمة المصادقة والعمليات الخلفية
+# أنظمة المصادقة والعمليات
 # ============================================================
 def require_auth(f):
     @wraps(f)
@@ -120,11 +107,11 @@ def _run_workflow(job_id, modal_url, payload):
         job = DubbingJob.query.get(job_id)
         try:
             response = requests.post(modal_url, json=payload, timeout=1800)
-            res = response.json()
-            if not res.get("success"): raise Exception(res.get('error'))
-            job.output_url = res.get("audio_url")
+            res_data = response.json()
+            if not res_data.get("success"): raise Exception(res_data.get('error'))
+            job.output_url = res_data.get("audio_url")
             job.status = 'completed'
-            if res.get("final_text"): job.extra_data = res.get("final_text")
+            if res_data.get("final_text"): job.extra_data = res_data.get("final_text")
         except Exception as e:
             job.status = 'failed'
             u = User.query.get(job.user_id)
@@ -136,11 +123,10 @@ def _run_workflow(job_id, modal_url, payload):
 def dub():
     media_file = request.files.get('media_file')
     user = request.user
-    if user.credits < 100: return jsonify({'error': 'Insufficient credits'}), 402
+    if user.credits < 100: return jsonify({'error': 'Credits low'}), 402
     
     job_id = str(uuid.uuid4())
-    filename = secure_filename(media_file.filename)
-    input_path = AUDIO_DIR / f"in_{job_id}_{filename}"
+    input_path = AUDIO_DIR / f"in_{job_id}_{secure_filename(media_file.filename)}"
     media_file.save(input_path)
 
     job = DubbingJob(id=job_id, user_id=user.id, status='processing', credits_used=100)
@@ -152,56 +138,28 @@ def dub():
     modal_payload = {
         "file_b64": file_b64,
         "lang": request.form.get('lang', 'ar'),
-        "voice_url": request.form.get('voice_url', ''), # الرابط المباشر من كلاوديناري
+        "voice_url": request.form.get('voice_url', ''),
         "voice_mode": "xtts" if request.form.get('voice_url') else "source"
     }
     
     _executor.submit(_run_workflow, job_id, "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/", modal_payload)
     return jsonify({'success': True, 'job_id': job_id}), 200
 
-@app.route('/api/tts', methods=['POST'])
-@require_auth
-def tts():
-    data = request.get_json()
-    user = request.user
-    if user.credits < 50: return jsonify({'error': 'Insufficient credits'}), 402
-    
-    job_id = str(uuid.uuid4())
-    job = DubbingJob(id=job_id, user_id=user.id, status='processing', credits_used=50)
-    user.credits -= 50
-    db.session.add(job); db.session.commit()
-
-    modal_payload = {
-        "text": data.get('text'),
-        "lang": data.get('lang', 'en'),
-        "voice_url": data.get('voice_url', ''),
-        "voice_id": "custom" if data.get('voice_url') else "source"
-    }
-
-    _executor.submit(_run_workflow, job_id, "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/tts", modal_payload)
-    return jsonify({'success': True, 'job_id': job_id}), 200
-
 @app.route('/api/job/<job_id>')
 @require_auth
 def get_job(job_id):
     job = DubbingJob.query.get(job_id)
-    if not job: return jsonify({'error': 'Not found'}), 404
     return jsonify({'status': job.status, 'audio_url': job.output_url, 'final_text': getattr(job, 'extra_data', '')})
 
 @app.route('/api/user')
 @require_auth
-def get_user(): return jsonify({'success': True, 'user': request.user.to_dict()})
+def get_current_user(): return jsonify({'success': True, 'user': request.user.to_dict()})
 
-@app.route('/api/auth/login', methods=['POST'])
-def login():
-    data = request.json
-    user = User.query.filter_by(email=data.get('email')).first()
-    if user and user.check_password(data.get('password')):
-        token = jwt.encode({'user_id': user.id, 'exp': datetime.utcnow() + timedelta(hours=24)}, app.config['SECRET_KEY'], algorithm='HS256')
-        resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
-        resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*3600)
-        return resp
-    return jsonify({'error': 'Invalid credentials'}), 401
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    resp = make_response(jsonify({'success': True}))
+    resp.set_cookie('sl_auth_token', '', expires=0, httponly=True, secure=True, samesite='None')
+    return resp
 
 if __name__ == '__main__':
     with app.app_context(): db.create_all()
