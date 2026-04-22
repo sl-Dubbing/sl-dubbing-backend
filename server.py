@@ -1,4 +1,4 @@
-# server.py — النسخة الاحترافية V25.0 (المقاومة للأخطاء)
+# server.py — النسخة المصححة V26.0 (حل مشكلة DB Language)
 import os, uuid, logging, requests, base64, jwt
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -11,10 +11,10 @@ from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv()
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 logger = logging.getLogger(__name__)
 
-ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500']
+ALLOWED_ORIGINS = ['https://sl-dubbing.github.io', 'http://localhost:5500', 'http://127.0.0.1:5500']
 AUDIO_DIR = Path('/tmp/sl_audio')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -38,12 +38,6 @@ except: CLOUDINARY_READY = False
 
 _executor = ThreadPoolExecutor(max_workers=5)
 
-# 🟢 معالج أخطاء عالمي لضمان رد JSON دائماً
-@app.errorhandler(Exception)
-def handle_exception(e):
-    logger.error(f"Global Error: {str(e)}")
-    return jsonify({"success": False, "error": f"Server Crash: {str(e)}"}), 500
-
 @app.route('/api/voices', methods=['GET'])
 def list_voices():
     voices = []
@@ -61,20 +55,18 @@ def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         token = request.cookies.get('sl_auth_token')
-        if not token: return jsonify({'error': 'Please login first'}), 401
+        if not token: return jsonify({'error': 'Unauthorized'}), 401
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            user = User.query.get(data.get('user_id'))
-            if not user: return jsonify({'error': 'User not found'}), 401
-            request.user = user
+            request.user = User.query.get(data.get('user_id'))
         except: return jsonify({'error': 'Session expired'}), 401
         return f(*args, **kwargs)
     return decorated_function
 
 def _run_workflow(job_id, payload):
     with app.app_context():
+        job = DubbingJob.query.get(job_id)
         try:
-            job = DubbingJob.query.get(job_id)
             factory_url = "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/"
             response = requests.post(factory_url, json=payload, timeout=1800)
             res = response.json()
@@ -90,14 +82,26 @@ def _run_workflow(job_id, payload):
 def dub():
     try:
         media_file = request.files.get('media_file')
+        lang = request.form.get('lang', 'ar')
+        voice_url = request.form.get('voice_url', '')
+        voice_mode = "xtts" if voice_url else "source"
+        
         if not media_file: return jsonify({'error': 'No file uploaded'}), 400
         
         job_id = str(uuid.uuid4())
         input_path = AUDIO_DIR / f"in_{job_id}.mp4"
         media_file.save(input_path)
 
-        # 🟢 تأكدي من أن موديل DubbingJob يحتوي على هذه الأعمدة
-        job = DubbingJob(id=job_id, user_id=request.user.id, status='processing', credits_used=0)
+        # 🟢 الإصلاح الجوهري: إضافة البيانات المطلوبة لقاعدة البيانات
+        job = DubbingJob(
+            id=job_id, 
+            user_id=request.user.id, 
+            status='processing', 
+            language=lang,      # تم الإصلاح هنا
+            voice_mode=voice_mode, # تم الإصلاح هنا
+            method=voice_mode,     # تم الإصلاح هنا
+            credits_used=0
+        )
         db.session.add(job)
         db.session.commit()
 
@@ -106,26 +110,25 @@ def dub():
 
         payload = {
             "file_b64": file_b64,
-            "lang": request.form.get('lang', 'ar'),
-            "voice_url": request.form.get('voice_url', '')
+            "lang": lang,
+            "voice_url": voice_url
         }
         
         _executor.submit(_run_workflow, job_id, payload)
         return jsonify({'success': True, 'job_id': job_id})
     except Exception as e:
-        logger.exception("Dubbing endpoint failed")
-        return jsonify({'success': False, 'error': f"DB/File Error: {str(e)}"}), 500
+        logger.error(f"Dub Error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/job/<job_id>')
 @require_auth
 def get_job(job_id):
     job = DubbingJob.query.get(job_id)
-    if not job: return jsonify({'status': 'error', 'error': 'Job not found'}), 404
     return jsonify({'status': job.status, 'audio_url': job.output_url})
 
 @app.route('/api/user')
 @require_auth
-def get_user_data():
+def get_user():
     return jsonify({'success': True, 'user': request.user.to_dict()})
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -137,7 +140,7 @@ def login():
         resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
         resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*3600)
         return resp
-    return jsonify({'error': 'Invalid email or password'}), 401
+    return jsonify({'error': 'Invalid credentials'}), 401
 
 if __name__ == '__main__':
     with app.app_context(): db.create_all()
