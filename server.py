@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta
 from threading import Thread
-from flask import Flask, request, jsonify, make_response, send_file, Response
+from flask import Flask, request, jsonify, make_response, send_file, Response, session
 from flask_cors import CORS
 from dotenv import load_dotenv
 import jwt
@@ -15,7 +15,7 @@ from functools import wraps
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.utils import secure_filename
-from werkzeug.middleware.proxy_fix import ProxyFix  # 🟢 مهم جداً لحل مشاكل الكوكيز في Railway
+from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 import base64
 import shutil
@@ -30,7 +30,7 @@ DEBUG = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# 🟢 التحديث الأهم: تحديد رابط موقعك صراحة بدلاً من النجمة لمنع خطأ CORS
+# 🟢 حماية CORS لتسمح فقط بموقعك على GitHub
 ALLOWED_ORIGINS = [
     'https://sl-dubbing.github.io',
     'http://localhost:5500',
@@ -41,8 +41,7 @@ AUDIO_DIR = Path('/tmp/sl_audio')
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
-
-# 🟢 إخبار Flask بأنه يعمل خلف وكيل (Railway) لكي تعمل الكوكيز الآمنة بشكل صحيح
+# 🟢 تعريف الـ Proxy لتعمل الكوكيز بشكل صحيح على Railway
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 app.config['DEBUG'] = DEBUG
@@ -55,7 +54,6 @@ if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# 🟢 تطبيق إعدادات CORS الصحيحة
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 limiter = Limiter(get_remote_address, app=app, default_limits=["1000 per day"], storage_uri="memory://")
 
@@ -101,11 +99,8 @@ def generate_auth_response(user, is_new=False):
         'iat': datetime.utcnow(), 'exp': datetime.utcnow() + timedelta(hours=24)
     }, app.config['SECRET_KEY'], algorithm='HS256')
     resp = make_response(jsonify({'success': True, 'user': user.to_dict(), 'is_new': is_new}))
-    # إعدادات الكوكيز الصارمة للربط بين النطاقات
     resp.set_cookie('sl_auth_token', token, httponly=True, secure=True, samesite='None', max_age=24*60*60)
     return resp
-
-# === دوال العمليات في الخلفية ===
 
 def process_full_workflow(payload):
     with app.app_context():
@@ -126,24 +121,22 @@ def process_full_workflow(payload):
                 "filename": payload.get('filename'),
                 "lang": payload.get('lang', 'ar'),
                 "voice_mode": payload.get('voice_mode', 'xtts'),
-                "voice_url": payload.get('voice_url', ''),
+                "voice_id": payload.get('voice_url', ''), # تمرير الاسم المختار كـ voice_id بدلاً من URL
                 "openai_key": os.environ.get("OPENAI_API_KEY", "")
-            }, timeout=1800) # رفعنا المهلة لتطابق تحديث Modal
+            }, timeout=1800)
 
             if response.status_code != 200: raise Exception(f"Modal returned status {response.status_code}")
             result_data = response.json()
             if not result_data.get("success"): raise Exception(f"Factory Error: {result_data.get('error')}")
 
-            # 🟢 التحديث الجديد: الاعتماد على رابط Google Cloud من Modal إذا وجد
+            # الاعتماد على رابط Google Cloud من Modal
             if "audio_url" in result_data:
                 audio_url = result_data["audio_url"]
             else:
-                # خطة بديلة إذا رجع Modal Base64 القديم
                 audio_base64 = result_data.get("audio_base64")
                 audio_bytes = base64.b64decode(audio_base64)
                 mp_path = AUDIO_DIR / f"dub_{job_id}.mp3"
                 with open(mp_path, "wb") as f: f.write(audio_bytes)
-
                 if CLOUDINARY_AVAILABLE:
                     resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/audio", public_id=f"dub_{job_id}", overwrite=True)
                     audio_url = resp.get('secure_url') or resp.get('url')
@@ -164,8 +157,7 @@ def process_full_workflow(payload):
                 if job:
                     job.status = 'failed'; db.session.add(job)
                     u = User.query.get(job.user_id)
-                    if u and job.credits_used:
-                        u.credits += job.credits_used
+                    if u and job.credits_used: u.credits += job.credits_used
                     db.session.commit()
             except Exception: db.session.rollback()
 
@@ -189,7 +181,6 @@ def process_tts_workflow(job_id, user_id, payload):
             result_data = response.json()
             if not result_data.get("success"): raise Exception(f"TTS Error: {result_data.get('error')}")
 
-            # 🟢 التحديث الجديد: أخذ الرابط الجاهز من Google Cloud (Modal)
             if "audio_url" in result_data:
                 audio_url = result_data["audio_url"]
             else:
@@ -197,7 +188,6 @@ def process_tts_workflow(job_id, user_id, payload):
                 audio_bytes = base64.b64decode(audio_base64)
                 mp_path = AUDIO_DIR / f"tts_{job_id}.mp3"
                 with open(mp_path, "wb") as f: f.write(audio_bytes)
-
                 if CLOUDINARY_AVAILABLE:
                     resp = cloudinary.uploader.upload(str(mp_path), resource_type='auto', folder="sl-dubbing/tts", public_id=f"tts_{job_id}", overwrite=True)
                     audio_url = resp.get('secure_url') or resp.get('url')
@@ -208,21 +198,16 @@ def process_tts_workflow(job_id, user_id, payload):
             job.output_url = audio_url
             job.status = 'completed'
             job.processing_time = time.time() - start_ts
-            
             tts_extra_data[job_id] = result_data.get("final_text", "")
-            
             db.session.add(job); db.session.commit()
         except Exception as exc:
             try:
                 if job:
                     job.status = 'failed'; db.session.add(job)
                     u = User.query.get(job.user_id)
-                    if u and job.credits_used:
-                        u.credits += job.credits_used
+                    if u and job.credits_used: u.credits += job.credits_used
                     db.session.commit()
             except Exception: db.session.rollback()
-
-# === مسارات الـ API ===
 
 @app.route('/api/auth/register', methods=['POST', 'OPTIONS'])
 def register():
@@ -251,7 +236,10 @@ def google_login():
     data = request.get_json(force=True, silent=True)
     token = data.get('credential')
     try:
-        CLIENT_ID = "497619073475-6vjelufub8gci231ettdhmk5pv0cdde3.apps.googleusercontent.com"
+        # 🟢 قراءة ה- Client ID من بيئة Railway بأمان
+        CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+        if not CLIENT_ID:
+            return jsonify({'success': False, 'error': 'Server configuration missing GOOGLE_CLIENT_ID'}), 500
         idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
         email = idinfo['email']
         name = idinfo.get('name', email.split('@')[0])
@@ -286,13 +274,13 @@ def dub():
     input_path = AUDIO_DIR / f"in_{job_id}_{filename}"
     media_file.save(input_path)
 
-    job = DubbingJob(id=job_id, user_id=user.id, language=request.form.get('lang', 'ar'), voice_mode=request.form.get('voice_mode', 'xtts'), credits_used=100, status='processing', method='dub')
+    job = DubbingJob(id=job_id, user_id=user.id, language=request.form.get('lang', 'ar'), voice_mode=request.form.get('voice_mode', 'source'), credits_used=100, status='processing', method='dub')
     user.credits -= 100
     db.session.add(job); db.session.commit()
 
     payload = {
         'job_id': job_id, 'user_id': user.id, 'lang': job.language,
-        'voice_mode': job.voice_mode, 'voice_url': request.form.get('voice_url', ''),
+        'voice_mode': job.voice_mode, 'voice_url': request.form.get('voice_mode', ''), # استخدام voice_mode كـ ID للصوت
         'file_path': str(input_path), 'filename': filename
     }
     Thread(target=process_full_workflow, args=(payload,), daemon=True).start()
@@ -320,33 +308,41 @@ def tts():
     Thread(target=process_tts_workflow, args=(job_id, user.id, payload), daemon=True).start()
     return jsonify({'success': True, 'job_id': job_id, 'status': 'processing'}), 200
 
-@app.route('/api/progress/<job_id>', methods=['GET'])
+# 🟢 الحماية الصارمة لمسار التتبع
+@app.route('/api/progress/<job_id>', methods=['GET', 'OPTIONS'])
+@require_auth
 def get_progress(job_id):
+    if request.method == 'OPTIONS': return jsonify({'ok': True}), 200
+    
+    job_check = DubbingJob.query.get(job_id)
+    if job_check and job_check.user_id != request.user.id:
+        return jsonify({'error': 'Access Denied'}), 403
+
     def generate():
         while True:
             with app.app_context():
-                job = DubbingJob.query.get(job_id)
-                if not job:
+                current_job = DubbingJob.query.get(job_id)
+                if not current_job:
                     yield f"data: {json.dumps({'status': 'error', 'error': 'Job not found'})}\n\n"
                     break
                 
-                progress_val = 50 if job.status == 'processing' else (100 if job.status == 'completed' else 0)
-                msg = "AI is working..." if job.status == 'processing' else job.status
+                progress_val = 50 if current_job.status == 'processing' else (100 if current_job.status == 'completed' else 0)
+                msg = "AI is working..." if current_job.status == 'processing' else current_job.status
 
                 final_text = ""
-                if job.status == 'completed':
+                if current_job.status == 'completed':
                     final_text = tts_extra_data.get(job_id, "")
 
                 payload = {
-                    "status": "done" if job.status == 'completed' else job.status,
+                    "status": "done" if current_job.status == 'completed' else current_job.status,
                     "progress": progress_val,
                     "message": msg,
-                    "audio_url": job.output_url,
+                    "audio_url": current_job.output_url,
                     "final_text": final_text
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
                 
-                if job.status in ['completed', 'failed', 'error']:
+                if current_job.status in ['completed', 'failed', 'error']:
                     if job_id in tts_extra_data: del tts_extra_data[job_id]
                     break
             time.sleep(1.5)
@@ -356,7 +352,7 @@ def get_progress(job_id):
 @require_auth
 def get_job(job_id):
     job = DubbingJob.query.get(job_id)
-    if not job: return jsonify({'error': 'Not found'}), 404
+    if not job or job.user_id != request.user.id: return jsonify({'error': 'Not found or Access Denied'}), 404
     return jsonify({
         'success': True, 'job_id': job.id, 'status': job.status, 'audio_url': job.output_url,
         'method': job.method, 'processing_time': job.processing_time, 'credits_used': job.credits_used,
