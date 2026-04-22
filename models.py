@@ -54,6 +54,10 @@ class DubbingJob(db.Model):
     output_url = db.Column(db.String(1000), nullable=True)
     processing_time = db.Column(db.Float, nullable=True)
     method = db.Column(db.String(50), nullable=True)
+    
+    # 🟢 العمود الجديد لحفظ النصوص المترجمة والبيانات الإضافية
+    extra_data = db.Column(db.Text, nullable=True) 
+    
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
