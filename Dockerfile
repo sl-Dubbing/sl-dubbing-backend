@@ -23,4 +23,4 @@ COPY . /app
 
 ENV PORT=5000
 
-CMD ["sh", "-c", "gunicorn server:app -b 0.0.0.0:${PORT} --workers 1 --threads 4"]
+CMD ["sh", "-c", "gunicorn server:app -b 0.0.0.0:${PORT} -k gevent --worker-connections 1000"]
