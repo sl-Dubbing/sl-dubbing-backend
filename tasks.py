@@ -14,7 +14,7 @@ celery_app = Celery('sl_dubbing_tasks', broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.update(
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=100,
-    task_time_limit=1800, # رفعنا الوقت ليتناسب مع مقاطع الفيديو الطويلة
+    task_time_limit=1800, 
     task_soft_time_limit=1700,
     task_serializer='json',
     accept_content=['json'],
@@ -35,9 +35,9 @@ flask_app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 flask_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(flask_app)
 
-MODAL_URL = os.environ.get("MODAL_URL", "https://sl-dubbing--sl-dubbing-factory-fastapi-app.modal.run/")
-if not MODAL_URL.endswith('/'):
-    MODAL_URL += '/'
+# ⚡ تعديل هام: فصل روابط Modal إلى رابطين (دبلجة و TTS)
+MODAL_DUBBING_URL = os.environ.get("MODAL_DUBBING_URL", "https://your_workspace--sl-dubbing-factory-fastapi-app.modal.run")
+MODAL_TTS_URL = os.environ.get("MODAL_TTS_URL", "https://your_workspace--sl-tts-factory-fastapi-app.modal.run")
 
 def _refund_and_fail(job, error_msg):
     """إعادة الرصيد للمستخدم وتحديث حالة المهمة للفشل"""
@@ -64,11 +64,27 @@ def process_dub(self, payload):
         if not job: return {"status": "error", "error": "Job not found"}
         
         try:
-            # نرسل الطلب للمصنع (الذي سيرفع النتيجة لـ Google Cloud مباشرة)
-            response = requests.post(MODAL_URL, json=payload, timeout=1800)
+            # ⚡ تعديل هام: إرسال الطلب كـ Form-Data (ملف + نصوص)
+            file_path = payload.get('file_path')
+            
+            if not file_path or not os.path.exists(file_path):
+                raise Exception("Media file not found on Railway disk")
+
+            url = f"{MODAL_DUBBING_URL.rstrip('/')}/upload"
+            
+            with open(file_path, 'rb') as f:
+                files = {'media_file': f}
+                data = {
+                    'lang': payload.get('lang', 'en'),
+                    'voice_id': payload.get('voice_id', 'source'),
+                    'sample_b64': payload.get('sample_b64', '')
+                }
+                
+                # نرسل files و data وليس json
+                response = requests.post(url, files=files, data=data, timeout=1800)
             
             if response.status_code != 200: 
-                raise Exception(f"Modal returned HTTP {response.status_code}")
+                raise Exception(f"Modal returned HTTP {response.status_code}: {response.text}")
             
             result_data = response.json()
             if not result_data.get("success"): 
@@ -79,6 +95,12 @@ def process_dub(self, payload):
             job.extra_data = result_data.get("translated_text", "")
             job.status = 'completed'
             db.session.commit()
+
+            # 🧹 تنظيف الملف المؤقت من سيرفر Railway بعد نجاح المهمة لتوفير المساحة
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logger.warning(f"Could not remove temp file {file_path}: {e}")
 
             return {"status": "done", "job_id": job_id, "audio_url": job.output_url}
 
@@ -97,17 +119,19 @@ def process_smart_tts(self, payload):
         if not job: return {"status": "error", "error": "Job not found"}
 
         try:
-            tts_url = MODAL_URL + "tts"
+            # ⚡ استخدام الرابط المخصص للـ TTS
+            tts_url = f"{MODAL_TTS_URL.rstrip('/')}/tts"
+            
+            # هنا إرسال JSON صحيح لأن مصنع الـ TTS يتوقع JSON
             response = requests.post(tts_url, json=payload, timeout=1800)
 
             if response.status_code != 200: 
-                raise Exception(f"Modal returned HTTP {response.status_code}")
+                raise Exception(f"Modal returned HTTP {response.status_code}: {response.text}")
             
             result_data = response.json()
             if not result_data.get("success"): 
                 raise Exception(result_data.get('error', 'Unknown TTS Error'))
 
-            # استلام الرابط من Google Cloud وحفظ النص النهائي في قاعدة البيانات
             job.output_url = result_data.get("audio_url")
             job.extra_data = result_data.get("final_text", "")
             job.status = 'completed'
