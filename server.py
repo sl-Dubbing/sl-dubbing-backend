@@ -262,7 +262,15 @@ def get_job(job_id):
 
 @app.errorhandler(413)
 def request_entity_too_large(error): return jsonify({"error": f"File is too large. Maximum size is {MAX_UPLOAD_BYTES // (1024*1024)}MB."}), 413
-
+@app.route('/api/voices', methods=['GET'])
+def get_voices():
+    """مسار بسيط لإرجاع قائمة الأصوات للواجهة الأمامية وتجنب خطأ 404"""
+    # يمكنك لاحقاً إضافة الأصوات الحقيقية هنا، هذه قائمة مبدئية لكي يعمل الموقع
+    voices = [
+        {"id": "muhammad_ar", "name": "Muhammad (Arabic)", "gender": "male", "lang": "ar"},
+        {"id": "default", "name": "Default Voice", "gender": "neutral", "lang": "en"}
+    ]
+    return jsonify({"success": True, "voices": voices})
 if __name__ == '__main__':
     with app.app_context(): db.create_all()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
