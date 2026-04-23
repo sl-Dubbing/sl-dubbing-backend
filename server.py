@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 app = Flask(__name__)
-# إعداد السجلات (Logs) لتظهر بوضوح في Railway
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -17,11 +16,13 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://', 1)
 db.init_app(app)
 
+# 🟢 إعدادات CORS للسماح لموقعك بالاتصال بأمان
 CORS(app, supports_credentials=True, origins=["https://sl-dubbing.github.io"])
 
 executor = ThreadPoolExecutor(max_workers=10)
 DUB_URL = os.environ.get("MODAL_DUB_URL", "").rstrip('/')
 
+# 🔐 حماية المسارات
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -30,11 +31,54 @@ def token_required(f):
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
             current_user = User.query.get(data['user_id'])
+            if not current_user: raise Exception()
         except: return jsonify({'error': 'Invalid token'}), 401
         return f(current_user, *args, **kwargs)
     return decorated
 
-# ⚙️ محرك المهام الخلفية المطور
+# ==========================================
+# 🟢 مسار تسجيل الدخول بجوجل (الذي كان مفقوداً)
+# ==========================================
+@app.route('/api/auth/google', methods=['POST'])
+def google_auth():
+    data = request.json
+    token = data.get('credential')
+    
+    # التحقق من توكن جوجل
+    google_res = requests.get(f"https://oauth2.googleapis.com/tokeninfo?id_token={token}")
+    if google_res.status_code != 200: 
+        return jsonify({'error': 'Invalid Google token'}), 401
+        
+    g_data = google_res.json()
+    email = g_data.get('email')
+    
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        user = User(
+            email=email, 
+            name=g_data.get('name'), 
+            avatar=g_data.get('picture'), 
+            auth_method='google', 
+            credits=1000
+        )
+        db.session.add(user)
+        db.session.commit()
+
+    my_token = jwt.encode(
+        {'user_id': user.id, 'exp': time.time() + 604800}, 
+        app.config['SECRET_KEY'], 
+        algorithm="HS256"
+    )
+    return jsonify({'success': True, 'token': my_token, 'user': user.to_dict()})
+
+@app.route('/api/user', methods=['GET'])
+@token_required
+def get_user_data(current_user):
+    return jsonify({'success': True, 'user': current_user.to_dict()})
+
+# ==========================================
+# ⚙️ محرك المهام الخلفية والدبلجة
+# ==========================================
 def run_background_task(job_id, service_type, payload, cost, user_id):
     with app.app_context():
         job = DubbingJob.query.get(job_id)
@@ -43,8 +87,6 @@ def run_background_task(job_id, service_type, payload, cost, user_id):
         
         try:
             full_url = f"{DUB_URL}/upload"
-            logger.info(f"🚀 Sending Job {job_id} to Modal...")
-
             file_path = payload.pop("_file_path")
             voice_path = payload.pop("_voice_path", None)
 
@@ -53,68 +95,59 @@ def run_background_task(job_id, service_type, payload, cost, user_id):
                 if voice_path:
                     files['voice_sample'] = open(voice_path, 'rb')
 
-                # إرسال الطلب مع مهلة زمنية طويلة للدبلجة
                 res = requests.post(full_url, data=payload, files=files, timeout=1800)
-                
                 if voice_path: files['voice_sample'].close()
 
-            # 🔍 هنا الإصلاح: التأكد من الرد قبل التحويل لـ JSON
             logger.info(f"📡 Modal Response Status: {res.status_code}")
             
             if res.status_code != 200:
-                logger.error(f"❌ Modal Error Content: {res.text[:500]}")
-                raise Exception(f"Modal Server returned {res.status_code}")
+                raise Exception(f"AI Server Error: {res.status_code}")
 
             data = res.json()
             if data.get("success"):
                 job.output_url = data.get("audio_url")
                 job.status = 'completed'
-                logger.info(f"✅ Job {job_id} Done!")
             else: 
-                raise Exception(data.get("error", "Unknown AI Error"))
+                raise Exception(data.get("error", "AI Process Failed"))
 
         except Exception as e:
-            logger.error(f"❌ Background Task Failed: {str(e)}")
+            logger.error(f"❌ Task Failed: {str(e)}")
             job.status = 'failed'
             if user: user.credits += cost 
         finally:
             if os.path.exists(file_path): os.remove(file_path)
             db.session.commit()
 
-@app.route('/api/dub', methods=['POST', 'OPTIONS'])
+@app.route('/api/dub', methods=['POST'])
 @token_required
 def upload_dub(current_user):
-    if request.method == 'OPTIONS': return jsonify({}), 200
-    try:
-        cost = 100
-        if current_user.credits < cost: return jsonify({"error": "No Credits"}), 402
-        
-        file = request.files['media_file']
-        temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{file.filename}")
-        file.save(temp_path)
-        
-        voice_val = request.form.get('voice_id', 'original')
-        safe_mode = "cloudinary_voice" if voice_val.startswith('http') else voice_val
-        
-        job = DubbingJob(
-            id=str(uuid.uuid4()), user_id=current_user.id, status='processing', 
-            language=request.form.get('lang', 'ar'), voice_mode=safe_mode[:50], credits_used=cost
-        )
-        current_user.credits -= cost
-        db.session.add(job)
-        db.session.commit()
+    cost = 100
+    if current_user.credits < cost: return jsonify({"error": "No Credits"}), 402
+    
+    file = request.files['media_file']
+    temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{file.filename}")
+    file.save(temp_path)
+    
+    voice_val = request.form.get('voice_id', 'original')
+    safe_mode = "cloudinary_voice" if voice_val.startswith('http') else voice_val
+    
+    job = DubbingJob(
+        id=str(uuid.uuid4()), user_id=current_user.id, status='processing', 
+        language=request.form.get('lang', 'ar'), voice_mode=safe_mode[:50], credits_used=cost
+    )
+    current_user.credits -= cost
+    db.session.add(job)
+    db.session.commit()
 
-        payload = {"lang": job.language, "voice_id": voice_val, "_file_path": temp_path}
-        if 'voice_sample' in request.files:
-            v_file = request.files['voice_sample']
-            v_path = os.path.join(tempfile.gettempdir(), f"v_{uuid.uuid4()}.wav")
-            v_file.save(v_path)
-            payload["_voice_path"] = v_path
+    payload = {"lang": job.language, "voice_id": voice_val, "_file_path": temp_path}
+    if 'voice_sample' in request.files:
+        v_file = request.files['voice_sample']
+        v_path = os.path.join(tempfile.gettempdir(), f"v_{uuid.uuid4()}.wav")
+        v_file.save(v_path)
+        payload["_voice_path"] = v_path
 
-        executor.submit(run_background_task, job.id, "dub", payload, cost, current_user.id)
-        return jsonify({"success": True, "job_id": job.id})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    executor.submit(run_background_task, job.id, "dub", payload, cost, current_user.id)
+    return jsonify({"success": True, "job_id": job.id})
 
 @app.route('/api/progress/<job_id>')
 def get_progress(job_id):
