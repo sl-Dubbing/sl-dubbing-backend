@@ -17,7 +17,7 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://', 1)
 db.init_app(app)
 
-CORS(app, resources={r"/*": {"origins": "*"}}) # للتسهيل حالياً
+CORS(app, supports_credentials=True, origins=["https://sl-dubbing.github.io"])
 
 executor = ThreadPoolExecutor(max_workers=10)
 DUB_URL = os.environ.get("MODAL_DUB_URL", "").rstrip('/')
