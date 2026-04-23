@@ -13,7 +13,7 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://', 1)
 db.init_app(app)
 
-# ⚡ 1. السماح بالاتصالات
+# ⚡ 1. إعدادات الـ CORS للسماح للمتصفح بالاتصال
 CORS(app, resources={
     r"/*": {
         "origins": ["https://sl-dubbing.github.io", "http://localhost:5500", "http://127.0.0.1:5500"],
@@ -27,7 +27,7 @@ executor = ThreadPoolExecutor(max_workers=10)
 DUB_URL = os.environ.get("MODAL_DUB_URL", "").rstrip('/')
 TTS_URL = os.environ.get("MODAL_TTS_URL", "").rstrip('/')
 
-# ⚡ 2. حماية المسارات
+# ⚡ 2. حماية المسارات (Authentication Middleware)
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -84,7 +84,7 @@ def get_user_data(current_user):
     return jsonify({'success': True, 'user': current_user.to_dict()})
 
 # ==========================================
-# ⚙️ مسارات الذكاء الاصطناعي المحدثة والمحمية من الانهيار
+# ⚙️ مسارات الذكاء الاصطناعي (مقاومة للانهيار)
 # ==========================================
 def run_background_task(job_id, service_type, payload, cost, user_id):
     with app.app_context():
@@ -107,7 +107,6 @@ def run_background_task(job_id, service_type, payload, cost, user_id):
 
                 res = requests.post(full_url, data=payload, files=files, timeout=1800)
 
-                # إغلاق وحذف الملفات المؤقتة
                 files['media_file'].close()
                 if os.path.exists(file_path): os.remove(file_path)
                 
@@ -128,7 +127,7 @@ def run_background_task(job_id, service_type, payload, cost, user_id):
         except Exception as e:
             logging.error(f"Task Failed: {e}")
             job.status = 'failed'
-            user.credits = (user.credits or 0) + cost # استرجاع الرصيد
+            user.credits = (user.credits or 0) + cost # استرجاع الرصيد في حال الفشل
         finally:
             db.session.commit()
 
@@ -145,7 +144,6 @@ def upload_dub(current_user):
             return jsonify({"error": "الرجاء رفع ملف"}), 400
 
         file = request.files['media_file']
-        # استخدام tempfile لتجنب أخطاء النظام
         temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{file.filename}")
         file.save(temp_path)
         
@@ -163,7 +161,6 @@ def upload_dub(current_user):
             "_file_path": temp_path
         }
         
-        # معالجة العينة الصوتية المرفوعة
         if 'voice_sample' in request.files:
             v_file = request.files['voice_sample']
             v_path = os.path.join(tempfile.gettempdir(), f"voice_{uuid.uuid4()}_{v_file.filename}")
@@ -176,7 +173,6 @@ def upload_dub(current_user):
         
     except Exception as e:
         logging.error(f"Upload Error: {str(e)}")
-        # نرجع الخطأ بصيغة JSON لمنع عطل المتصفح
         return jsonify({"success": False, "error": f"Internal Server Error: {str(e)}"}), 500
 
 @app.route('/api/progress/<job_id>', methods=['GET', 'OPTIONS'])
@@ -189,9 +185,7 @@ def get_progress(job_id):
                 if not job:
                     yield f"data: {json.dumps({'status': 'error'})}\n\n"
                     break
-                
                 yield f"data: {json.dumps({'status': job.status, 'audio_url': job.output_url, 'extra_data': job.extra_data})}\n\n"
-                
                 if job.status in ['completed', 'failed']: break
             time.sleep(2)
     return Response(generate(), mimetype='text/event-stream')
