@@ -126,7 +126,7 @@ def run_background_task(job_id, service_type, payload, cost, user_id):
         except Exception as e:
             logging.error(f"Task Failed: {e}")
             job.status = 'failed'
-            user.credits = (user.credits or 0) + cost # استرجاع الرصيد
+            user.credits = (user.credits or 0) + cost # استرجاع الرصيد عند الفشل
         finally:
             db.session.commit()
 
@@ -150,13 +150,16 @@ def upload_dub(current_user):
         lang = request.form.get('lang', 'ar')
         voice_val = request.form.get('voice_id', 'original')
         
-        # 💡 الإصلاح هنا: أضفنا voice_mode و credits_used المطلوبة في قاعدة البيانات
+        # 💡 الحل السحري: نقوم بقص القيمة إذا كانت رابطاً طويلاً لتناسب قاعدة البيانات (50 حرف)
+        safe_voice_mode = "cloudinary_voice" if voice_val.startswith('http') else voice_val
+        if len(safe_voice_mode) > 50: safe_voice_mode = safe_voice_mode[:50]
+        
         job = DubbingJob(
             id=job_id, 
             user_id=current_user.id, 
             status='processing', 
             language=lang,
-            voice_mode=voice_val,
+            voice_mode=safe_voice_mode, # نحفظ الكلمة القصيرة هنا
             credits_used=cost
         )
         
@@ -164,6 +167,7 @@ def upload_dub(current_user):
         db.session.add(job)
         db.session.commit()
 
+        # ولكن نرسل الرابط الطويل كاملاً لمحرك الذكاء الاصطناعي!
         payload = {
             "lang": lang, 
             "voice_id": voice_val, 
@@ -177,7 +181,6 @@ def upload_dub(current_user):
             payload["_voice_path"] = v_path
             payload["voice_id"] = "custom"
             
-            # تحديث قاعدة البيانات لتسجيل أن المستخدم رفع عينة مخصصة
             job.voice_mode = "custom_upload"
             db.session.commit()
         
@@ -200,7 +203,6 @@ def tts_route(current_user):
         data = request.json
         job_id = str(uuid.uuid4())
         
-        # 💡 إضافة voice_mode لعملية الـ TTS أيضاً لمنع الانهيار
         job = DubbingJob(
             id=job_id, 
             user_id=current_user.id, 
