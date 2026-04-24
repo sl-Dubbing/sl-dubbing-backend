@@ -6,6 +6,7 @@ from uuid import uuid4
 
 db = SQLAlchemy()
 
+
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -36,11 +37,12 @@ class User(db.Model):
             'name': self.name,
             'avatar': self.avatar,
             'credits': self.credits,
-            'auth_method': self.auth_method
+            'auth_method': self.auth_method,
         }
 
     def __repr__(self):
         return f"<User {self.email}>"
+
 
 class DubbingJob(db.Model):
     __tablename__ = 'dubbing_jobs'
@@ -54,15 +56,30 @@ class DubbingJob(db.Model):
     output_url = db.Column(db.String(1000), nullable=True)
     processing_time = db.Column(db.Float, nullable=True)
     method = db.Column(db.String(50), nullable=True)
-    
-    # 🟢 العمود الجديد لحفظ النصوص المترجمة والبيانات الإضافية
-    extra_data = db.Column(db.Text, nullable=True) 
-    
+
+    # ✅ حفظ النصوص المترجمة والـ metadata
+    extra_data = db.Column(db.Text, nullable=True)
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'status': self.status,
+            'language': self.language,
+            'voice_mode': self.voice_mode,
+            'credits_used': self.credits_used,
+            'output_url': self.output_url,
+            'processing_time': self.processing_time,
+            'method': self.method,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
     def __repr__(self):
         return f"<DubbingJob {self.id} status={self.status}>"
+
 
 class CreditTransaction(db.Model):
     __tablename__ = 'credit_transactions'
