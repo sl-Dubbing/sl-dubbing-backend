@@ -27,7 +27,7 @@ celery_app.conf.update(
 )
 
 # ==========================================
-# 🗄️ إعداد Flask لاستخدام قاعدة البيانات داخل الـ Worker
+# 🗄️ Flask app context للـ Worker
 # ==========================================
 from models import db, User, DubbingJob, CreditTransaction
 from flask import Flask
@@ -41,7 +41,7 @@ flask_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(flask_app)
 
 # ==========================================
-# 🌐 روابط خدمات Modal
+# 🌐 Modal endpoints
 # ==========================================
 MODAL_DUBBING_URL = os.environ.get(
     "MODAL_DUBBING_URL",
@@ -54,19 +54,16 @@ MODAL_TTS_URL = os.environ.get(
 
 
 # ==========================================
-# 🔤 مصحح النصوص المدمج (كان text_corrector.py سابقاً)
+# 🔤 مصحح النصوص (text_corrector.py مدمج)
 # ==========================================
 def _call_openai_with_retries(payload, headers, max_attempts=3):
-    """استدعاء OpenAI مع backoff exponential"""
     backoff = 1
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=120,
+                headers=headers, json=payload, timeout=120,
             )
             if resp.status_code == 429:
                 time.sleep(backoff)
@@ -85,27 +82,20 @@ def _call_openai_with_retries(payload, headers, max_attempts=3):
 
 
 def smart_correct_text(raw_text: str, api_key: str = None) -> str:
-    """تصحيح الأخطاء الإملائية والنحوية في النص العربي."""
     if not raw_text or not raw_text.strip():
         return raw_text
 
     openai_key = api_key or os.getenv("OPENAI_API_KEY")
     if not openai_key:
-        logger.info("No OPENAI_API_KEY — skipping correction.")
         return raw_text
 
     system_prompt = (
-        "أنت مدقق لغوي ومترجم محترف في استوديو دبلجة. سأعطيك نصاً مترجماً. "
-        "مهمتك: 1) صحح الأخطاء الإملائية والنحوية فقط. "
-        "2) استبدل الكلمات الأجنبية المكتوبة بحروف عربية بأصلها الإنجليزي. "
-        "3) لا تغيّر المعنى ولا تضف شيئاً. "
-        "4) أعد النص المصحَّح فقط بدون أي شرح."
+        "أنت مدقق لغوي ومترجم محترف في استوديو دبلجة. "
+        "صحح الأخطاء الإملائية والنحوية فقط، استبدل الكلمات الأجنبية المكتوبة "
+        "بحروف عربية بأصلها الإنجليزي، ولا تغيّر المعنى. أعد النص فقط بدون شرح."
     )
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {openai_key}",
-    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {openai_key}"}
     payload = {
         "model": "gpt-3.5-turbo",
         "messages": [
@@ -123,7 +113,6 @@ def smart_correct_text(raw_text: str, api_key: str = None) -> str:
             message = choices[0].get('message') or {}
             corrected = (message.get('content') or '').strip()
             return corrected if corrected else raw_text
-        logger.warning(f"OpenAI returned no choices: {response_data}")
         return raw_text
     except Exception as e:
         logger.error(f"Text correction failed: {e}")
@@ -134,7 +123,6 @@ def smart_correct_text(raw_text: str, api_key: str = None) -> str:
 # 🛠️ دوال مساعدة
 # ==========================================
 def _refund_and_fail(job, error_msg):
-    """إعادة الرصيد للمستخدم وتحديث حالة المهمة للفشل"""
     try:
         logger.error(f"Job {job.id} failed: {error_msg}")
         u = User.query.get(job.user_id)
@@ -153,8 +141,7 @@ def _refund_and_fail(job, error_msg):
         db.session.rollback()
 
 
-def _safe_remove(path: str):
-    """حذف ملف مع تجاهل الأخطاء"""
+def _safe_remove(path):
     try:
         if path and os.path.exists(path):
             os.remove(path)
@@ -163,7 +150,7 @@ def _safe_remove(path: str):
 
 
 # ==========================================
-# 🎙️ المسار الأول: الدبلجة (ملف فيديو/صوت)
+# 🎙️ المهمة 1: الدبلجة
 # ==========================================
 @celery_app.task(name='tasks.process_dub', bind=True, max_retries=1)
 def process_dub(self, payload):
@@ -184,8 +171,6 @@ def process_dub(self, payload):
                 raise Exception("Media file not found on disk")
 
             url = f"{MODAL_DUBBING_URL.rstrip('/')}/upload"
-
-            # ⚡ إرسال الطلب كـ multipart form-data
             with open(file_path, 'rb') as f:
                 files = {'media_file': f}
                 data = {
@@ -204,7 +189,6 @@ def process_dub(self, payload):
             if not result_data.get("success"):
                 raise Exception(result_data.get('error', 'Unknown Dubbing Error'))
 
-            # ✅ تصحيح النص المترجم اختيارياً
             translated_text = result_data.get("translated_text", "") or ""
             if translated_text and os.getenv("ENABLE_TEXT_CORRECTION", "0") == "1":
                 translated_text = smart_correct_text(translated_text)
@@ -216,22 +200,17 @@ def process_dub(self, payload):
             db.session.commit()
 
             logger.info(f"[{job_id}] ✅ Completed in {job.processing_time}s")
-            return {
-                "status": "done",
-                "job_id": job_id,
-                "audio_url": job.output_url,
-            }
+            return {"status": "done", "job_id": job_id, "audio_url": job.output_url}
 
         except Exception as e:
             _refund_and_fail(job, str(e))
             return {"status": "error", "job_id": job_id, "error": str(e)}
         finally:
-            # 🧹 تنظيف الملف المؤقت دائماً
             _safe_remove(file_path)
 
 
 # ==========================================
-# 🌍 المسار الثاني: تحويل النص إلى صوت (TTS)
+# 🌍 المهمة 2: TTS
 # ==========================================
 @celery_app.task(name='tasks.process_smart_tts', bind=True, max_retries=1)
 def process_smart_tts(self, payload):
@@ -247,13 +226,11 @@ def process_smart_tts(self, payload):
 
         try:
             tts_url = f"{MODAL_TTS_URL.rstrip('/')}/tts"
-
             body = {
                 'text': payload.get('text', ''),
                 'lang': payload.get('lang', 'en'),
                 'voice_id': payload.get('voice_id', ''),
             }
-
             response = requests.post(tts_url, json=body, timeout=1800)
             if response.status_code != 200:
                 raise Exception(
@@ -275,11 +252,7 @@ def process_smart_tts(self, payload):
             db.session.commit()
 
             logger.info(f"[{job_id}] ✅ TTS completed in {job.processing_time}s")
-            return {
-                "status": "done",
-                "job_id": job_id,
-                "audio_url": job.output_url,
-            }
+            return {"status": "done", "job_id": job_id, "audio_url": job.output_url}
 
         except Exception as e:
             _refund_and_fail(job, str(e))
