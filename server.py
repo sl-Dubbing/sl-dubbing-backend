@@ -1,4 +1,4 @@
-# server.py — V2.0 (Celery-based, Modal-integrated)
+# server.py — V2.1 (Celery + Modal + multi-origin CORS)
 import os
 import uuid
 import json
@@ -6,6 +6,7 @@ import logging
 import time
 import base64
 import tempfile
+import datetime as _dt
 from functools import wraps
 
 import jwt
@@ -16,7 +17,6 @@ from dotenv import load_dotenv
 
 from models import db, User, DubbingJob, CreditTransaction
 
-# تحميل المتغيرات البيئية
 load_dotenv()
 
 app = Flask(__name__)
@@ -36,18 +36,52 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
-# CORS — تسمح لموقعك بالاتصال مع التوكنات
-CORS(app, supports_credentials=True, origins=[
+# ✅ إصلاح CORS: السماح بكل النطاقات الموجودة فعلياً
+ALLOWED_ORIGINS = [
     "https://sl-dubbing.github.io",
-    "https://sl-dubbing.github.io/",
-])
+    "https://sl-dubbing-frontend.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5500",
+]
+extra_origins = os.environ.get('EXTRA_CORS_ORIGINS', '')
+if extra_origins:
+    ALLOWED_ORIGINS += [o.strip() for o in extra_origins.split(',') if o.strip()]
 
-# ✅ استيراد Celery tasks (بدلاً من ThreadPoolExecutor)
+CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS)
+
 from tasks import process_dub, process_smart_tts
 
-# سقوف الملفات
 MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', 100))
 app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+# ==========================================
+# 🛠️ دوال مساعدة
+# ==========================================
+def _extract_voice_name(value: str) -> str:
+    """
+    استخراج اسم الملف من URL Cloudinary أو إعادة القيمة كما هي.
+    أمثلة:
+      "https://res.cloudinary.com/.../sl_voice/muhammad_ar.wav" -> "muhammad_ar"
+      "muhammad" -> "muhammad"
+      "original"/"source" -> "source"
+    """
+    if not value:
+        return "source"
+    v = value.strip()
+    if v in ("original", "source", ""):
+        return "source"
+    if v == "custom":
+        return "custom"
+    if v.startswith('http'):
+        try:
+            tail = v.rsplit('/', 1)[-1]
+            name = tail.rsplit('.', 1)[0]
+            return name or "source"
+        except Exception:
+            return "source"
+    return v
 
 
 # ==========================================
@@ -91,7 +125,6 @@ def google_auth():
         if not google_token:
             return jsonify({'error': 'No credential provided'}), 400
 
-        # التحقق من توكن جوجل
         google_res = requests.get(
             f"https://oauth2.googleapis.com/tokeninfo?id_token={google_token}",
             timeout=10,
@@ -116,7 +149,7 @@ def google_auth():
             db.session.add(user)
             db.session.commit()
         else:
-            user.last_login = __import__('datetime').datetime.utcnow()
+            user.last_login = _dt.datetime.utcnow()
             db.session.commit()
 
         my_token = jwt.encode(
@@ -142,7 +175,7 @@ def get_user_data(current_user):
 
 
 # ==========================================
-# 🎙️ مسار الدبلجة (ملف فيديو/صوت → دبلجة)
+# 🎙️ مسار الدبلجة
 # ==========================================
 @app.route('/api/dub', methods=['POST'])
 @token_required
@@ -160,30 +193,27 @@ def upload_dub(current_user):
         if not file or not file.filename:
             return jsonify({"error": "ملف غير صالح"}), 400
 
-        # حفظ الملف الرئيسي مؤقتاً
         safe_name = f"{uuid.uuid4()}_{os.path.basename(file.filename)}"
         temp_path = os.path.join(tempfile.gettempdir(), safe_name)
         file.save(temp_path)
 
-        voice_val = request.form.get('voice_id', 'source')
-        # الأرقام الطويلة من كلاوديناري → تُصنّف
-        safe_mode = "cloudinary_voice" if voice_val.startswith('http') else voice_val
+        raw_voice = request.form.get('voice_id', 'original')
+        voice_name = _extract_voice_name(raw_voice)
 
-        # بصمة صوتية مرفوعة؟ → حوّلها إلى base64 لتمريرها لـ Modal
         sample_b64 = ""
         if 'voice_sample' in request.files:
             v_file = request.files['voice_sample']
             if v_file and v_file.filename:
                 sample_bytes = v_file.read()
                 sample_b64 = base64.b64encode(sample_bytes).decode('utf-8')
+                voice_name = "source"  # عند وجود sample، تجاهل voice_id
 
-        # إنشاء Job
         job = DubbingJob(
             id=str(uuid.uuid4()),
             user_id=current_user.id,
             status='processing',
             language=request.form.get('lang', 'ar'),
-            voice_mode=safe_mode[:50],
+            voice_mode=voice_name[:50],
             credits_used=cost,
             method='dubbing',
         )
@@ -198,12 +228,11 @@ def upload_dub(current_user):
         ))
         db.session.commit()
 
-        # إرسال المهمة إلى Celery
         payload = {
             'job_id': job.id,
             'file_path': temp_path,
             'lang': job.language,
-            'voice_id': voice_val,
+            'voice_id': voice_name,
             'sample_b64': sample_b64,
         }
         process_dub.delay(payload)
@@ -212,7 +241,6 @@ def upload_dub(current_user):
 
     except Exception as e:
         logger.error(f"Upload Error: {e}")
-        # تنظيف إذا فشل الإدراج قبل إرسال Celery
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -222,7 +250,7 @@ def upload_dub(current_user):
 
 
 # ==========================================
-# 🌍 مسار تحويل النص إلى صوت (TTS)
+# 🌍 مسار TTS
 # ==========================================
 @app.route('/api/tts', methods=['POST'])
 @token_required
@@ -231,12 +259,13 @@ def upload_tts(current_user):
         data = request.json or {}
         text = (data.get('text') or '').strip()
         lang = data.get('lang', 'en')
-        voice_id = data.get('voice_id', '')
+        raw_voice = data.get('voice_id', '')
+        voice_name = _extract_voice_name(raw_voice) if raw_voice else ''
+        sample_b64 = data.get('sample_b64', '') or ''
 
         if not text:
             return jsonify({"error": "النص فارغ"}), 400
 
-        # التكلفة بناءً على طول النص (كل 100 حرف = 10 كريدت)
         cost = max(10, (len(text) // 100) * 10)
         if (current_user.credits or 0) < cost:
             return jsonify({"error": "رصيد غير كافٍ"}), 402
@@ -246,7 +275,7 @@ def upload_tts(current_user):
             user_id=current_user.id,
             status='processing',
             language=lang,
-            voice_mode=(voice_id or 'default')[:50],
+            voice_mode=(voice_name or 'default')[:50],
             credits_used=cost,
             text_length=len(text),
             method='tts',
@@ -266,7 +295,8 @@ def upload_tts(current_user):
             'job_id': job.id,
             'text': text,
             'lang': lang,
-            'voice_id': voice_id,
+            'voice_id': voice_name,
+            'sample_b64': sample_b64,
         }
         process_smart_tts.delay(payload)
 
@@ -278,7 +308,7 @@ def upload_tts(current_user):
 
 
 # ==========================================
-# 📡 حالة المهمة
+# 📡 حالة المهمة (polling) — للسكربت
 # ==========================================
 @app.route('/api/job/<job_id>', methods=['GET'])
 @token_required
@@ -302,13 +332,13 @@ def get_job(current_user, job_id):
 
 
 # ==========================================
-# 📡 SSE — بث التقدم للمتصفح
+# 📡 SSE — بث التقدم (يعمل لكل أنواع المهام)
 # ==========================================
 @app.route('/api/progress/<job_id>')
 def get_progress(job_id):
     def generate():
         last_status = None
-        deadline = time.time() + 1800  # 30 دقيقة كحد أقصى
+        deadline = time.time() + 1800
         while time.time() < deadline:
             with app.app_context():
                 job = DubbingJob.query.get(job_id)
@@ -335,6 +365,18 @@ def get_progress(job_id):
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok', 'time': int(time.time())})
+
+
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({
+        'service': 'sl-dubbing-backend',
+        'status': 'running',
+        'endpoints': [
+            '/api/health', '/api/auth/google', '/api/user',
+            '/api/dub', '/api/tts', '/api/job/<id>', '/api/progress/<id>',
+        ],
+    })
 
 
 if __name__ == '__main__':
