@@ -230,6 +230,7 @@ def process_smart_tts(self, payload):
                 'text': payload.get('text', ''),
                 'lang': payload.get('lang', 'en'),
                 'voice_id': payload.get('voice_id', ''),
+                'sample_b64': payload.get('sample_b64', ''),
             }
             response = requests.post(tts_url, json=body, timeout=1800)
             if response.status_code != 200:
