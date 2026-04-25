@@ -7,8 +7,6 @@ import os, tempfile, subprocess, shutil, json, uuid, logging, base64, traceback
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sl-dubbing")
 
-# ✅ إصلاح: torch 2.1.2 متوافق مع TTS 0.22.0 (الـ 2.4.x يكسر XTTS)
-# ✅ إصلاح: numpy<2 ضروري لأن TTS 0.22.0 لا يدعم numpy 2.x
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("ffmpeg", "libasound2", "libsndfile1")
@@ -47,7 +45,6 @@ class DubbingService:
     def load_models(self):
         from faster_whisper import WhisperModel
         from TTS.api import TTS
-        # ✅ "large-v3-turbo" يتطلب faster-whisper >= 1.0.3
         self.whisper = WhisperModel("large-v3", device="cuda", compute_type="float16")
         self.xtts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
         logger.info("✅ Dubbing Models Loaded")
@@ -65,16 +62,14 @@ class DubbingService:
         return blob.public_url
 
     def _prepare_speaker(self, voice_id: str, sample_b64: str, temp_dir: str, fallback_wav: str):
-        """تجهيز الصوت المرجعي: بصمة مخصصة → Cloudinary → الصوت الأصلي."""
         import requests
 
-        # 1) بصمة صوتية مرفوعة (Voice Cloning)
+        # 1) بصمة صوتية مرفوعة
         if sample_b64:
             try:
                 custom_raw = os.path.join(temp_dir, "custom_raw")
                 with open(custom_raw, "wb") as f:
                     f.write(base64.b64decode(sample_b64))
-                # تحويل إلى wav قياسي
                 custom_path = os.path.join(temp_dir, "custom_speaker.wav")
                 result = subprocess.run(
                     ["ffmpeg", "-y", "-i", custom_raw,
@@ -87,13 +82,21 @@ class DubbingService:
             except Exception as e:
                 logger.error(f"Custom speaker preparation failed: {e}")
 
-        # 2) صوت من Cloudinary
+        # 2) Cloudinary
         if voice_id and voice_id not in ("source", "original", ""):
             try:
-                url = f"https://res.cloudinary.com/dxbmvzsiz/video/upload/sl_voices/{voice_id}.mp3"
+                url = f"https://res.cloudinary.com/dxbmvzsiz/video/upload/sl_voice/{voice_id}.wav"
                 r = requests.get(url, timeout=15)
+                if r.status_code != 200:
+                    # جرب الامتدادات الأخرى
+                    for ext in ("mp3", "m4a"):
+                        url2 = f"https://res.cloudinary.com/dxbmvzsiz/video/upload/sl_voice/{voice_id}.{ext}"
+                        r = requests.get(url2, timeout=15)
+                        if r.status_code == 200:
+                            break
+
                 if r.status_code == 200:
-                    cloud_path = os.path.join(temp_dir, "cloud_speaker.mp3")
+                    cloud_path = os.path.join(temp_dir, "cloud_speaker_raw")
                     with open(cloud_path, "wb") as f:
                         f.write(r.content)
                     wav_cloud_path = os.path.join(temp_dir, "cloud_speaker_fmt.wav")
@@ -106,11 +109,11 @@ class DubbingService:
                         return wav_cloud_path
                     logger.error(f"Cloudinary ffmpeg failed: {result.stderr[:200]}")
                 else:
-                    logger.warning(f"Cloudinary returned HTTP {r.status_code} for {voice_id}")
+                    logger.warning(f"Cloudinary HTTP {r.status_code} for {voice_id}")
             except Exception as e:
                 logger.error(f"Cloudinary fetch failed: {e}")
 
-        # 3) الصوت الأصلي للمقطع كـ fallback
+        # 3) الصوت الأصلي للمقطع
         return fallback_wav
 
     @modal.asgi_app()
@@ -129,7 +132,6 @@ class DubbingService:
 
             temp_dir = tempfile.mkdtemp()
             try:
-                # [1] استخراج الصوت من الملف المُرسل
                 in_path = os.path.join(temp_dir, "input")
                 with open(in_path, "wb") as f:
                     f.write(await media_file.read())
@@ -143,10 +145,8 @@ class DubbingService:
                 if result.returncode != 0:
                     raise RuntimeError(f"ffmpeg failed: {result.stderr[:300]}")
 
-                # [2] تجهيز الصوت المرجعي
                 speaker_wav = self._prepare_speaker(voice_id, sample_b64, temp_dir, wav_path)
 
-                # [3] التفريغ النصي
                 segments, info = self.whisper.transcribe(wav_path, beam_size=1)
                 segments_list = list(segments)
                 logger.info(f"✅ Transcribed {len(segments_list)} segments, lang={info.language}")
@@ -157,9 +157,7 @@ class DubbingService:
                         status_code=400,
                     )
 
-                # [4] الترجمة + توليد المقاطع
                 translator = GoogleTranslator(source="auto", target=lang)
-                final_audio = AudioSegment.silent(duration=0)
                 max_ms = 0
                 generated_segments = []
                 translated_parts = []
@@ -171,7 +169,7 @@ class DubbingService:
                     try:
                         txt = translator.translate(src_txt) or src_txt
                     except Exception as e:
-                        logger.warning(f"Translate failed for '{src_txt[:40]}': {e}")
+                        logger.warning(f"Translate failed: {e}")
                         txt = src_txt
 
                     translated_parts.append(txt)
@@ -179,10 +177,8 @@ class DubbingService:
 
                     try:
                         self.xtts.tts_to_file(
-                            text=txt,
-                            file_path=out_seg,
-                            speaker_wav=speaker_wav,
-                            language=lang,
+                            text=txt, file_path=out_seg,
+                            speaker_wav=speaker_wav, language=lang,
                         )
                         s_aud = AudioSegment.from_wav(out_seg)
                         start_ms = int(seg.start * 1000)
@@ -199,12 +195,10 @@ class DubbingService:
                         status_code=500,
                     )
 
-                # [5] بناء الصوت النهائي بطول صحيح
                 final_audio = AudioSegment.silent(duration=max_ms + 500)
                 for start_ms, seg_audio in generated_segments:
                     final_audio = final_audio.overlay(seg_audio, position=start_ms)
 
-                # [6] التصدير والرفع
                 res_path = os.path.join(temp_dir, "res.wav")
                 final_audio.export(res_path, format="wav")
                 url = self._upload_to_gcs(res_path)
