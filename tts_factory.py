@@ -55,10 +55,28 @@ class TTSService:
         blob.make_public()
         return blob.public_url
 
-    def _prepare_speaker(self, voice_id: str, temp_dir: str):
-        import requests
+    def _prepare_speaker(self, voice_id: str, sample_b64: str, temp_dir: str):
+        import requests, base64
 
-        # محاولة جلب الصوت المحدد
+        # ✅ أولوية 1: عينة base64 مرسلة من السكربت (من مجلد samples/)
+        if sample_b64:
+            try:
+                custom_raw = os.path.join(temp_dir, "custom_raw")
+                with open(custom_raw, "wb") as f:
+                    f.write(base64.b64decode(sample_b64))
+                custom_path = os.path.join(temp_dir, "custom_speaker.wav")
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-i", custom_raw,
+                     "-ar", "22050", "-ac", "1", custom_path],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0 and os.path.exists(custom_path):
+                    return custom_path
+                logger.error(f"Custom speaker ffmpeg failed: {result.stderr[:200]}")
+            except Exception as e:
+                logger.error(f"Custom speaker preparation failed: {e}")
+
+        # أولوية 2: محاولة جلب الصوت المحدد من Cloudinary
         if voice_id and voice_id not in ("source", "original", ""):
             for ext in ("wav", "mp3", "m4a"):
                 try:
@@ -124,6 +142,7 @@ class TTSService:
             text = (data.get("text") or "").strip()
             lang = data.get("lang", "en")
             voice_id = data.get("voice_id", "")
+            sample_b64 = data.get("sample_b64", "") or ""
 
             if not text:
                 return JSONResponse(
@@ -141,7 +160,7 @@ class TTSService:
             temp_dir = tempfile.mkdtemp()
             try:
                 out_path = os.path.join(temp_dir, "output.wav")
-                speaker_wav = self._prepare_speaker(voice_id, temp_dir)
+                speaker_wav = self._prepare_speaker(voice_id, sample_b64, temp_dir)
 
                 if not speaker_wav or not os.path.exists(speaker_wav):
                     return JSONResponse(
