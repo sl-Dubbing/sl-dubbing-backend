@@ -7,8 +7,6 @@ import os, tempfile, json, uuid, logging, subprocess, shutil
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sl-tts")
 
-# ✅ إصلاح: torch 2.1.2 متوافق مع TTS 0.22.0
-# ✅ إصلاح: numpy<2 ضروري
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("ffmpeg", "libsndfile1")
@@ -31,7 +29,6 @@ image = (
 app = modal.App("sl-tts-factory")
 
 
-# ✅ إصلاح حرج: image=image كان مفقوداً في النسخة الأصلية
 @app.cls(
     image=image,
     gpu="T4",
@@ -59,55 +56,54 @@ class TTSService:
         return blob.public_url
 
     def _prepare_speaker(self, voice_id: str, temp_dir: str):
-        """جلب الصوت المرجعي من Cloudinary وتحويله إلى WAV"""
         import requests
 
         # محاولة جلب الصوت المحدد
         if voice_id and voice_id not in ("source", "original", ""):
-            try:
-                url = f"https://res.cloudinary.com/dxbmvzsiz/video/upload/sl_voices/{voice_id}.mp3"
-                r = requests.get(url, timeout=15)
-                if r.status_code == 200:
-                    cloud_path = os.path.join(temp_dir, "cloud_speaker.mp3")
-                    with open(cloud_path, "wb") as f:
-                        f.write(r.content)
-                    wav_cloud_path = os.path.join(temp_dir, "cloud_speaker_fmt.wav")
-                    result = subprocess.run(
-                        ["ffmpeg", "-y", "-i", cloud_path,
-                         "-ar", "22050", "-ac", "1", wav_cloud_path],
-                        capture_output=True, text=True,
-                    )
-                    if result.returncode == 0 and os.path.exists(wav_cloud_path):
-                        return wav_cloud_path
-                    logger.error(f"ffmpeg failed: {result.stderr[:200]}")
-                else:
-                    logger.warning(f"Cloudinary HTTP {r.status_code} for {voice_id}")
-            except Exception as e:
-                logger.error(f"Cloudinary fetch failed: {e}")
+            for ext in ("wav", "mp3", "m4a"):
+                try:
+                    url = f"https://res.cloudinary.com/dxbmvzsiz/video/upload/sl_voice/{voice_id}.{ext}"
+                    r = requests.get(url, timeout=15)
+                    if r.status_code == 200:
+                        cloud_path = os.path.join(temp_dir, f"cloud_speaker.{ext}")
+                        with open(cloud_path, "wb") as f:
+                            f.write(r.content)
+                        wav_cloud_path = os.path.join(temp_dir, "cloud_speaker_fmt.wav")
+                        result = subprocess.run(
+                            ["ffmpeg", "-y", "-i", cloud_path,
+                             "-ar", "22050", "-ac", "1", wav_cloud_path],
+                            capture_output=True, text=True,
+                        )
+                        if result.returncode == 0 and os.path.exists(wav_cloud_path):
+                            return wav_cloud_path
+                        logger.error(f"ffmpeg failed: {result.stderr[:200]}")
+                except Exception as e:
+                    logger.error(f"Cloudinary fetch failed for .{ext}: {e}")
+                    continue
 
-        # الصوت الاحتياطي
-        fallback_url = "https://res.cloudinary.com/dxbmvzsiz/video/upload/sl_voices/muhammad.mp3"
-        try:
-            r = requests.get(fallback_url, timeout=15)
-            if r.status_code != 200:
-                logger.error(f"Fallback HTTP {r.status_code}")
-                return None
-            fallback_path = os.path.join(temp_dir, "fallback.mp3")
-            fallback_wav = os.path.join(temp_dir, "fallback.wav")
-            with open(fallback_path, "wb") as f:
-                f.write(r.content)
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-i", fallback_path,
-                 "-ar", "22050", "-ac", "1", fallback_wav],
-                capture_output=True, text=True,
-            )
-            if result.returncode == 0 and os.path.exists(fallback_wav):
-                return fallback_wav
-            logger.error(f"Fallback ffmpeg failed: {result.stderr[:200]}")
-            return None
-        except Exception as e:
-            logger.error(f"Fallback preparation failed: {e}")
-            return None
+        # Fallback
+        for ext in ("wav", "mp3"):
+            try:
+                fallback_url = f"https://res.cloudinary.com/dxbmvzsiz/video/upload/sl_voice/muhammad_ar.{ext}"
+                r = requests.get(fallback_url, timeout=15)
+                if r.status_code != 200:
+                    continue
+                fallback_path = os.path.join(temp_dir, f"fallback.{ext}")
+                fallback_wav = os.path.join(temp_dir, "fallback.wav")
+                with open(fallback_path, "wb") as f:
+                    f.write(r.content)
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-i", fallback_path,
+                     "-ar", "22050", "-ac", "1", fallback_wav],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0 and os.path.exists(fallback_wav):
+                    return fallback_wav
+            except Exception as e:
+                logger.error(f"Fallback {ext} failed: {e}")
+                continue
+
+        return None
 
     @modal.asgi_app()
     def fastapi_app(self):
@@ -135,7 +131,6 @@ class TTSService:
                     status_code=400,
                 )
 
-            # الترجمة مع fallback
             try:
                 translator = GoogleTranslator(source="auto", target=lang)
                 translated_text = translator.translate(text) or text
@@ -148,7 +143,6 @@ class TTSService:
                 out_path = os.path.join(temp_dir, "output.wav")
                 speaker_wav = self._prepare_speaker(voice_id, temp_dir)
 
-                # ✅ XTTS v2 يتطلب speaker_wav دائماً
                 if not speaker_wav or not os.path.exists(speaker_wav):
                     return JSONResponse(
                         {"success": False,
