@@ -332,6 +332,99 @@ def get_job(current_user, job_id):
 
 
 # ==========================================
+# ⚡⚡⚡ مسار TTS سريع جداً (Streaming Pass-Through)
+# يتجاوز Celery لأقصى سرعة — TTFB ~300-500ms
+# ==========================================
+@app.route('/api/tts/quick', methods=['POST'])
+@token_required
+def tts_quick(current_user):
+    """
+    TTS فوري بدون Celery — يبثّ MP3 chunks مباشرة من Modal للمتصفح.
+    لا يحفظ في DB، لا يحتاج SSE/polling.
+    
+    استخدم لـ:
+    - التطبيقات التفاعلية (chatbots، voice assistants)
+    - الجمل القصيرة
+    - الحالات التي لا تحتاج voice cloning
+    """
+    try:
+        data = request.json or {}
+        text = (data.get('text') or '').strip()
+
+        if not text:
+            return jsonify({"error": "النص فارغ"}), 400
+
+        # تكلفة منخفضة لأنه fast mode
+        cost = max(5, len(text) // 200 * 5)
+        if (current_user.credits or 0) < cost:
+            return jsonify({"error": "رصيد غير كافٍ"}), 402
+
+        # خصم الرصيد فوراً
+        current_user.credits -= cost
+        db.session.add(CreditTransaction(
+            user_id=current_user.id,
+            transaction_type='debit',
+            amount=cost,
+            reason='Quick TTS',
+        ))
+        db.session.commit()
+
+        # ⚡ إرسال مباشر إلى Modal FastTTS streaming endpoint
+        modal_fast_url = os.environ.get(
+            'MODAL_TTS_FAST_URL',
+            'https://your_workspace--sl-tts-factory-fasttts-fastapi-app.modal.run'
+        )
+        stream_url = f"{modal_fast_url.rstrip('/')}/tts/stream"
+
+        # إعادة توجيه الـ stream من Modal للمتصفح
+        modal_response = requests.post(
+            stream_url,
+            json={
+                'text': text,
+                'lang': data.get('lang', 'en'),
+                'edge_voice': data.get('edge_voice', ''),
+                'translate': data.get('translate', True),
+                'rate': data.get('rate', '+0%'),
+                'pitch': data.get('pitch', '+0Hz'),
+            },
+            stream=True,
+            timeout=60,
+        )
+
+        if modal_response.status_code != 200:
+            # استرجاع الرصيد عند الفشل
+            current_user.credits += cost
+            db.session.commit()
+            return jsonify({
+                "error": f"Modal error: {modal_response.status_code}"
+            }), 500
+
+        def generate():
+            try:
+                for chunk in modal_response.iter_content(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+
+        return Response(
+            generate(),
+            mimetype='audio/mpeg',
+            headers={
+                'X-Voice': modal_response.headers.get('X-Voice', ''),
+                'X-Cost': str(cost),
+                'X-Remaining-Credits': str(current_user.credits),
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Quick TTS Error: {e}")
+        return jsonify({"error": "خطأ أثناء التوليد"}), 500
+
+
+# ==========================================
 # 📡 SSE — بث التقدم (يعمل لكل أنواع المهام)
 # ==========================================
 @app.route('/api/progress/<job_id>')
