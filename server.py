@@ -1,4 +1,4 @@
-# server.py — V2.2 (Celery + Modal + Cloudinary + multi-origin CORS)
+# server.py — V2.3 (Celery + Modal + Cloudflare R2)
 import os
 import uuid
 import json
@@ -11,8 +11,8 @@ from functools import wraps
 
 import jwt
 import requests
-import cloudinary
-import cloudinary.uploader
+import boto3
+from botocore.client import Config
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -38,7 +38,16 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
-# ✅ إصلاح CORS: السماح بكل النطاقات الموجودة فعلياً
+# إعداد Cloudflare R2 Client
+R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME', 'sl-dubbing-media')
+s3_client = boto3.client(
+    's3',
+    endpoint_url=os.environ.get('R2_ENDPOINT_URL'),
+    aws_access_key_id=os.environ.get('R2_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
+    config=Config(signature_version='s3v4'),
+)
+
 ALLOWED_ORIGINS = [
     "https://sl-dubbing.github.io",
     "https://sl-dubbing-frontend.vercel.app",
@@ -57,18 +66,7 @@ from tasks import process_dub, process_smart_tts
 MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', 100))
 app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 
-
-# ==========================================
-# 🛠️ دوال مساعدة
-# ==========================================
 def _extract_voice_name(value: str) -> str:
-    """
-    استخراج اسم الملف من URL Cloudinary أو إعادة القيمة كما هي.
-    أمثلة:
-      "https://res.cloudinary.com/.../sl_voice/muhammad_ar.wav" -> "muhammad_ar"
-      "muhammad" -> "muhammad"
-      "original"/"source" -> "source"
-    """
     if not value:
         return "source"
     v = value.strip()
@@ -85,10 +83,6 @@ def _extract_voice_name(value: str) -> str:
             return "source"
     return v
 
-
-# ==========================================
-# 🔐 ديكوريتور حماية المسارات
-# ==========================================
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -98,10 +92,8 @@ def token_required(f):
             parts = auth_header.split()
             if len(parts) == 2 and parts[0].lower() == 'bearer':
                 token = parts[1]
-
         if not token:
             return jsonify({'error': 'Unauthorized'}), 401
-
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
             current_user = User.query.get(data['user_id'])
@@ -111,14 +103,9 @@ def token_required(f):
             return jsonify({'error': 'Token expired'}), 401
         except Exception:
             return jsonify({'error': 'Invalid token'}), 401
-
         return f(current_user, *args, **kwargs)
     return decorated
 
-
-# ==========================================
-# 🔐 مسارات المصادقة
-# ==========================================
 @app.route('/api/auth/google', methods=['POST'])
 def google_auth():
     try:
@@ -126,19 +113,16 @@ def google_auth():
         google_token = data.get('credential')
         if not google_token:
             return jsonify({'error': 'No credential provided'}), 400
-
         google_res = requests.get(
             f"https://oauth2.googleapis.com/tokeninfo?id_token={google_token}",
             timeout=10,
         )
         if google_res.status_code != 200:
             return jsonify({'error': 'فشل التحقق من حساب جوجل'}), 401
-
         g_data = google_res.json()
         email = g_data.get('email')
         if not email:
             return jsonify({'error': 'Email not found in Google response'}), 400
-
         user = User.query.filter_by(email=email).first()
         if not user:
             user = User(
@@ -153,32 +137,21 @@ def google_auth():
         else:
             user.last_login = _dt.datetime.utcnow()
             db.session.commit()
-
         my_token = jwt.encode(
             {'user_id': user.id, 'exp': int(time.time()) + (86400 * 7)},
             app.config['SECRET_KEY'],
             algorithm="HS256",
         )
-
-        return jsonify({
-            'success': True,
-            'token': my_token,
-            'user': user.to_dict(),
-        })
+        return jsonify({'success': True, 'token': my_token, 'user': user.to_dict()})
     except Exception as e:
         logger.error(f"Google Auth Error: {e}")
         return jsonify({'error': 'حدث خطأ في السيرفر أثناء تسجيل الدخول'}), 500
-
 
 @app.route('/api/user', methods=['GET'])
 @token_required
 def get_user_data(current_user):
     return jsonify({'success': True, 'user': current_user.to_dict()})
 
-
-# ==========================================
-# 🎙️ مسار الدبلجة (تحديث التخزين السحابي)
-# ==========================================
 @app.route('/api/dub', methods=['POST'])
 @token_required
 def upload_dub(current_user):
@@ -194,13 +167,10 @@ def upload_dub(current_user):
         if not file or not file.filename:
             return jsonify({"error": "ملف غير صالح"}), 400
 
-        # ☁️ الرفع إلى Cloudinary بدلاً من المسار المحلي
-        upload_result = cloudinary.uploader.upload(
-            file,
-            resource_type="video", # نستخدم video لأنه يدعم الصوت والفيديو معاً
-            folder="sl_dubbing_uploads"
-        )
-        file_cloud_url = upload_result.get("secure_url")
+        # ☁️ الرفع إلى Cloudflare R2
+        safe_name = f"{uuid.uuid4()}_{os.path.basename(file.filename)}"
+        file_key = f"uploads/{safe_name}"
+        s3_client.upload_fileobj(file, R2_BUCKET_NAME, file_key)
 
         raw_voice = request.form.get('voice_id', 'original')
         voice_name = _extract_voice_name(raw_voice)
@@ -211,7 +181,7 @@ def upload_dub(current_user):
             if v_file and v_file.filename:
                 sample_bytes = v_file.read()
                 sample_b64 = base64.b64encode(sample_bytes).decode('utf-8')
-                voice_name = "source"  # عند وجود sample، تجاهل voice_id
+                voice_name = "source"
 
         job = DubbingJob(
             id=str(uuid.uuid4()),
@@ -233,10 +203,10 @@ def upload_dub(current_user):
         ))
         db.session.commit()
 
-        # 🚀 إرسال الرابط السحابي للـ Worker بدلاً من المسار المحلي
+        # 🚀 نرسل مفتاح الملف للـ Worker
         payload = {
             'job_id': job.id,
-            'file_url': file_cloud_url, 
+            'file_key': file_key,
             'lang': job.language,
             'voice_id': voice_name,
             'sample_b64': sample_b64,
@@ -249,10 +219,6 @@ def upload_dub(current_user):
         logger.error(f"Upload Error: {e}")
         return jsonify({"error": "حدث خطأ أثناء الرفع للسحابة"}), 500
 
-
-# ==========================================
-# 🌍 مسار TTS
-# ==========================================
 @app.route('/api/tts', methods=['POST'])
 @token_required
 def upload_tts(current_user):
@@ -307,17 +273,12 @@ def upload_tts(current_user):
         logger.error(f"TTS Error: {e}")
         return jsonify({"error": "حدث خطأ أثناء معالجة النص"}), 500
 
-
-# ==========================================
-# 📡 حالة المهمة (polling) — للسكربت
-# ==========================================
 @app.route('/api/job/<job_id>', methods=['GET'])
 @token_required
 def get_job(current_user, job_id):
     job = DubbingJob.query.get(job_id)
     if not job or job.user_id != current_user.id:
         return jsonify({'error': 'Job not found'}), 404
-
     return jsonify({
         'success': True,
         'job_id': job.id,
@@ -331,36 +292,17 @@ def get_job(current_user, job_id):
         'updated_at': job.updated_at.isoformat() if job.updated_at else None,
     })
 
-
-# ==========================================
-# ⚡⚡⚡ مسار TTS سريع جداً (Streaming Pass-Through)
-# يتجاوز Celery لأقصى سرعة — TTFB ~300-500ms
-# ==========================================
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
 def tts_quick(current_user):
-    """
-    TTS فوري بدون Celery — يبثّ MP3 chunks مباشرة من Modal للمتصفح.
-    لا يحفظ في DB، لا يحتاج SSE/polling.
-    
-    استخدم لـ:
-    - التطبيقات التفاعلية (chatbots، voice assistants)
-    - الجمل القصيرة
-    - الحالات التي لا تحتاج voice cloning
-    """
     try:
         data = request.json or {}
         text = (data.get('text') or '').strip()
-
         if not text:
             return jsonify({"error": "النص فارغ"}), 400
-
-        # تكلفة منخفضة لأنه fast mode
         cost = max(5, len(text) // 200 * 5)
         if (current_user.credits or 0) < cost:
             return jsonify({"error": "رصيد غير كافٍ"}), 402
-
-        # خصم الرصيد فوراً
         current_user.credits -= cost
         db.session.add(CreditTransaction(
             user_id=current_user.id,
@@ -370,14 +312,11 @@ def tts_quick(current_user):
         ))
         db.session.commit()
 
-        # ⚡ إرسال مباشر إلى Modal FastTTS streaming endpoint
         modal_fast_url = os.environ.get(
             'MODAL_TTS_FAST_URL',
             'https://your_workspace--sl-tts-factory-fasttts-fastapi-app.modal.run'
         )
         stream_url = f"{modal_fast_url.rstrip('/')}/tts/stream"
-
-        # إعادة توجيه الـ stream من Modal للمتصفح
         modal_response = requests.post(
             stream_url,
             json={
@@ -393,12 +332,9 @@ def tts_quick(current_user):
         )
 
         if modal_response.status_code != 200:
-            # استرجاع الرصيد عند الفشل
             current_user.credits += cost
             db.session.commit()
-            return jsonify({
-                "error": f"Modal error: {modal_response.status_code}"
-            }), 500
+            return jsonify({"error": f"Modal error: {modal_response.status_code}"}), 500
 
         def generate():
             try:
@@ -419,15 +355,10 @@ def tts_quick(current_user):
                 'X-Accel-Buffering': 'no',
             },
         )
-
     except Exception as e:
         logger.error(f"Quick TTS Error: {e}")
         return jsonify({"error": "خطأ أثناء التوليد"}), 500
 
-
-# ==========================================
-# 📡 SSE — بث التقدم (يعمل لكل أنواع المهام)
-# ==========================================
 @app.route('/api/progress/<job_id>')
 def get_progress(job_id):
     def generate():
@@ -439,39 +370,25 @@ def get_progress(job_id):
                 if not job:
                     yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
                     break
-                payload = {
-                    'status': job.status,
-                    'audio_url': job.output_url,
-                }
+                payload = {'status': job.status, 'audio_url': job.output_url}
                 if payload != last_status:
                     yield f"data: {json.dumps(payload)}\n\n"
                     last_status = payload
                 if job.status in ('completed', 'failed'):
                     break
             time.sleep(2)
-
     return Response(generate(), mimetype='text/event-stream')
 
-
-# ==========================================
-# ❤️ Health
-# ==========================================
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok', 'time': int(time.time())})
-
 
 @app.route('/', methods=['GET'])
 def root():
     return jsonify({
         'service': 'sl-dubbing-backend',
         'status': 'running',
-        'endpoints': [
-            '/api/health', '/api/auth/google', '/api/user',
-            '/api/dub', '/api/tts', '/api/job/<id>', '/api/progress/<id>',
-        ],
     })
-
 
 if __name__ == '__main__':
     with app.app_context():
