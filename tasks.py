@@ -1,10 +1,12 @@
-# tasks.py — V3.0 (Smart Routing: FastTTS vs ClonedTTS) + Cloud Storage Support
+# tasks.py — V3.1 (Smart Routing + Cloudflare R2 Integration)
 import os
 import time
 import logging
 import tempfile
 import uuid
 import requests
+import boto3
+from botocore.client import Config
 from celery import Celery
 from dotenv import load_dotenv
 
@@ -36,26 +38,19 @@ flask_app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 flask_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(flask_app)
 
-# ==========================================
-# 🌐 Modal endpoints
-# ==========================================
-MODAL_DUBBING_URL = os.environ.get(
-    "MODAL_DUBBING_URL",
-    "https://your_workspace--sl-dubbing-factory-dubbingmanager-fastapi-app.modal.run",
+# إعداد Cloudflare R2 Client
+R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME', 'sl-dubbing-media')
+s3_client = boto3.client(
+    's3',
+    endpoint_url=os.environ.get('R2_ENDPOINT_URL'),
+    aws_access_key_id=os.environ.get('R2_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
+    config=Config(signature_version='s3v4'),
 )
-# ⚡ FastTTS = للسرعة (بدون cloning)
-MODAL_TTS_FAST_URL = os.environ.get(
-    "MODAL_TTS_FAST_URL",
-    "https://your_workspace--sl-tts-factory-fasttts-fastapi-app.modal.run",
-)
-# 🎨 ClonedTTS = مع voice cloning
-MODAL_TTS_CLONED_URL = os.environ.get(
-    "MODAL_TTS_CLONED_URL",
-    "https://your_workspace--sl-tts-factory-clonedtts-fastapi-app.modal.run",
-)
-# للتوافق مع النسخ القديمة
-MODAL_TTS_URL = os.environ.get("MODAL_TTS_URL", MODAL_TTS_FAST_URL)
 
+MODAL_DUBBING_URL = os.environ.get("MODAL_DUBBING_URL", "")
+MODAL_TTS_FAST_URL = os.environ.get("MODAL_TTS_FAST_URL", "")
+MODAL_TTS_CLONED_URL = os.environ.get("MODAL_TTS_CLONED_URL", "")
 
 def _refund_and_fail(job, error_msg):
     try:
@@ -75,7 +70,6 @@ def _refund_and_fail(job, error_msg):
         logger.error(f"Refund failed: {e}")
         db.session.rollback()
 
-
 def _safe_remove(path):
     try:
         if path and os.path.exists(path):
@@ -83,15 +77,11 @@ def _safe_remove(path):
     except Exception as e:
         logger.warning(f"Could not remove {path}: {e}")
 
-
-# ==========================================
-# 🎙️ المهمة 1: الدبلجة
-# ==========================================
 @celery_app.task(name='tasks.process_dub', bind=True, max_retries=1)
 def process_dub(self, payload):
     job_id = payload.get('job_id')
-    file_url = payload.get('file_url')
-    logger.info(f"[{job_id}] Dubbing Worker started, downloading from cloud...")
+    file_key = payload.get('file_key')
+    logger.info(f"[{job_id}] Dubbing Worker started, fetching from R2...")
 
     temp_path = None
 
@@ -102,18 +92,12 @@ def process_dub(self, payload):
 
         start_ts = time.time()
         try:
-            if not file_url:
-                raise Exception("Media URL not found in payload")
+            if not file_key:
+                raise Exception("Media file key not found in payload")
 
-            # 1️⃣ تنزيل الملف من السحابة إلى الذاكرة المؤقتة للـ Worker
+            # 1️⃣ تنزيل الملف من Cloudflare R2 إلى Worker
             temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.tmp")
-            download_response = requests.get(file_url, stream=True)
-            if download_response.status_code == 200:
-                with open(temp_path, 'wb') as f:
-                    for chunk in download_response.iter_content(1024 * 1024):
-                        f.write(chunk)
-            else:
-                raise Exception(f"Failed to download media from cloud. Status: {download_response.status_code}")
+            s3_client.download_file(R2_BUCKET_NAME, file_key, temp_path)
 
             # 2️⃣ إرسال الملف إلى Modal
             url = f"{MODAL_DUBBING_URL.rstrip('/')}/upload"
@@ -128,9 +112,7 @@ def process_dub(self, payload):
                 response = requests.post(url, files=files, data=data, timeout=1800)
 
             if response.status_code != 200:
-                raise Exception(
-                    f"Modal returned HTTP {response.status_code}: {response.text[:300]}"
-                )
+                raise Exception(f"Modal HTTP {response.status_code}: {response.text[:300]}")
 
             result_data = response.json()
             if not result_data.get("success"):
@@ -142,6 +124,12 @@ def process_dub(self, payload):
             job.status = 'completed'
             db.session.commit()
 
+            # 3️⃣ حذف الملف من التخزين السحابي لتوفير المساحة
+            try:
+                s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=file_key)
+            except Exception as e:
+                logger.warning(f"Could not delete {file_key} from R2: {e}")
+
             logger.info(f"[{job_id}] ✅ Completed in {job.processing_time}s")
             return {"status": "done", "job_id": job_id, "audio_url": job.output_url}
 
@@ -149,20 +137,10 @@ def process_dub(self, payload):
             _refund_and_fail(job, str(e))
             return {"status": "error", "job_id": job_id, "error": str(e)}
         finally:
-            # تنظيف الملف المؤقت بعد الانتهاء لتوفير مساحة الـ Worker
             _safe_remove(temp_path)
 
-
-# ==========================================
-# 🌍 المهمة 2: TTS (Smart Routing)
-# ==========================================
 @celery_app.task(name='tasks.process_smart_tts', bind=True, max_retries=1)
 def process_smart_tts(self, payload):
-    """
-    🧠 توجيه ذكي:
-      - بدون voice_id/sample_b64 → FastTTS (Edge-TTS مباشرة، 300-500ms)
-      - مع voice cloning → ClonedTTS (Edge-TTS + OpenVoice، 1.5-2s)
-    """
     job_id = payload.get('job_id')
     logger.info(f"[{job_id}] TTS Worker started")
 
@@ -175,18 +153,12 @@ def process_smart_tts(self, payload):
         try:
             voice_id = payload.get('voice_id', '')
             sample_b64 = payload.get('sample_b64', '')
-
-            # 🧠 توجيه ذكي
-            needs_cloning = bool(sample_b64) or (
-                voice_id and voice_id not in ("source", "original", "")
-            )
+            needs_cloning = bool(sample_b64) or (voice_id and voice_id not in ("source", "original", ""))
 
             if needs_cloning:
                 tts_url = f"{MODAL_TTS_CLONED_URL.rstrip('/')}/tts"
-                logger.info(f"[{job_id}] 🎨 Routing to ClonedTTS")
             else:
                 tts_url = f"{MODAL_TTS_FAST_URL.rstrip('/')}/tts"
-                logger.info(f"[{job_id}] ⚡ Routing to FastTTS")
 
             body = {
                 'text': payload.get('text', ''),
@@ -199,14 +171,11 @@ def process_smart_tts(self, payload):
                 'pitch': payload.get('pitch', '+0Hz'),
             }
 
-            # timeout أقصر للـ FastTTS، أطول للـ ClonedTTS
             timeout = 60 if not needs_cloning else 600
             response = requests.post(tts_url, json=body, timeout=timeout)
 
             if response.status_code != 200:
-                raise Exception(
-                    f"Modal returned HTTP {response.status_code}: {response.text[:300]}"
-                )
+                raise Exception(f"Modal HTTP {response.status_code}: {response.text[:300]}")
 
             result_data = response.json()
             if not result_data.get("success"):
@@ -218,8 +187,6 @@ def process_smart_tts(self, payload):
             job.status = 'completed'
             db.session.commit()
 
-            logger.info(f"[{job_id}] ✅ TTS completed in {job.processing_time}s "
-                        f"(modal_latency={result_data.get('latency_ms', '?')}ms)")
             return {"status": "done", "job_id": job_id, "audio_url": job.output_url}
 
         except Exception as e:
