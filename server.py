@@ -1,4 +1,4 @@
-# server.py — V2.1 (Celery + Modal + multi-origin CORS)
+# server.py — V2.2 (Celery + Modal + Cloudinary + multi-origin CORS)
 import os
 import uuid
 import json
@@ -11,6 +11,8 @@ from functools import wraps
 
 import jwt
 import requests
+import cloudinary
+import cloudinary.uploader
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -175,12 +177,11 @@ def get_user_data(current_user):
 
 
 # ==========================================
-# 🎙️ مسار الدبلجة
+# 🎙️ مسار الدبلجة (تحديث التخزين السحابي)
 # ==========================================
 @app.route('/api/dub', methods=['POST'])
 @token_required
 def upload_dub(current_user):
-    temp_path = None
     try:
         cost = int(os.environ.get('DUB_COST', 100))
         if (current_user.credits or 0) < cost:
@@ -193,9 +194,13 @@ def upload_dub(current_user):
         if not file or not file.filename:
             return jsonify({"error": "ملف غير صالح"}), 400
 
-        safe_name = f"{uuid.uuid4()}_{os.path.basename(file.filename)}"
-        temp_path = os.path.join(tempfile.gettempdir(), safe_name)
-        file.save(temp_path)
+        # ☁️ الرفع إلى Cloudinary بدلاً من المسار المحلي
+        upload_result = cloudinary.uploader.upload(
+            file,
+            resource_type="video", # نستخدم video لأنه يدعم الصوت والفيديو معاً
+            folder="sl_dubbing_uploads"
+        )
+        file_cloud_url = upload_result.get("secure_url")
 
         raw_voice = request.form.get('voice_id', 'original')
         voice_name = _extract_voice_name(raw_voice)
@@ -228,9 +233,10 @@ def upload_dub(current_user):
         ))
         db.session.commit()
 
+        # 🚀 إرسال الرابط السحابي للـ Worker بدلاً من المسار المحلي
         payload = {
             'job_id': job.id,
-            'file_path': temp_path,
+            'file_url': file_cloud_url, 
             'lang': job.language,
             'voice_id': voice_name,
             'sample_b64': sample_b64,
@@ -241,12 +247,7 @@ def upload_dub(current_user):
 
     except Exception as e:
         logger.error(f"Upload Error: {e}")
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-        return jsonify({"error": "حدث خطأ أثناء الرفع"}), 500
+        return jsonify({"error": "حدث خطأ أثناء الرفع للسحابة"}), 500
 
 
 # ==========================================
