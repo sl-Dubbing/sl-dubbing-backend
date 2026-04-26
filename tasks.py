@@ -1,7 +1,9 @@
-# tasks.py — V3.0 (Smart Routing: FastTTS vs ClonedTTS)
+# tasks.py — V3.0 (Smart Routing: FastTTS vs ClonedTTS) + Cloud Storage Support
 import os
 import time
 import logging
+import tempfile
+import uuid
 import requests
 from celery import Celery
 from dotenv import load_dotenv
@@ -88,22 +90,34 @@ def _safe_remove(path):
 @celery_app.task(name='tasks.process_dub', bind=True, max_retries=1)
 def process_dub(self, payload):
     job_id = payload.get('job_id')
-    file_path = payload.get('file_path')
-    logger.info(f"[{job_id}] Dubbing Worker started")
+    file_url = payload.get('file_url')
+    logger.info(f"[{job_id}] Dubbing Worker started, downloading from cloud...")
+
+    temp_path = None
 
     with flask_app.app_context():
         job = DubbingJob.query.get(job_id)
         if not job:
-            _safe_remove(file_path)
             return {"status": "error", "error": "Job not found"}
 
         start_ts = time.time()
         try:
-            if not file_path or not os.path.exists(file_path):
-                raise Exception("Media file not found on disk")
+            if not file_url:
+                raise Exception("Media URL not found in payload")
 
+            # 1️⃣ تنزيل الملف من السحابة إلى الذاكرة المؤقتة للـ Worker
+            temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.tmp")
+            download_response = requests.get(file_url, stream=True)
+            if download_response.status_code == 200:
+                with open(temp_path, 'wb') as f:
+                    for chunk in download_response.iter_content(1024 * 1024):
+                        f.write(chunk)
+            else:
+                raise Exception(f"Failed to download media from cloud. Status: {download_response.status_code}")
+
+            # 2️⃣ إرسال الملف إلى Modal
             url = f"{MODAL_DUBBING_URL.rstrip('/')}/upload"
-            with open(file_path, 'rb') as f:
+            with open(temp_path, 'rb') as f:
                 files = {'media_file': f}
                 data = {
                     'lang': payload.get('lang', 'en'),
@@ -135,7 +149,8 @@ def process_dub(self, payload):
             _refund_and_fail(job, str(e))
             return {"status": "error", "job_id": job_id, "error": str(e)}
         finally:
-            _safe_remove(file_path)
+            # تنظيف الملف المؤقت بعد الانتهاء لتوفير مساحة الـ Worker
+            _safe_remove(temp_path)
 
 
 # ==========================================
