@@ -1,14 +1,16 @@
-# tasks.py — V3.1 (Smart Routing + Cloudflare R2 Integration)
+# tasks.py — V3.2 (Smart Routing + Cloudflare R2 Integration + Modal SDK for TTS)
 import os
 import time
 import logging
 import tempfile
 import uuid
 import requests
+import base64
 import boto3
 from botocore.client import Config
 from celery import Celery
 from dotenv import load_dotenv
+import modal # تأكد من أن مكتبة modal موجودة في requirements.txt
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -49,8 +51,7 @@ s3_client = boto3.client(
 )
 
 MODAL_DUBBING_URL = os.environ.get("MODAL_DUBBING_URL", "")
-MODAL_TTS_FAST_URL = os.environ.get("MODAL_TTS_FAST_URL", "")
-MODAL_TTS_CLONED_URL = os.environ.get("MODAL_TTS_CLONED_URL", "")
+# تم الاستغناء عن MODAL_TTS_URLs لأننا سنستخدم Modal SDK مباشرة للتوليد
 
 def _refund_and_fail(job, error_msg):
     try:
@@ -139,6 +140,7 @@ def process_dub(self, payload):
         finally:
             _safe_remove(temp_path)
 
+
 @celery_app.task(name='tasks.process_smart_tts', bind=True, max_retries=1)
 def process_smart_tts(self, payload):
     job_id = payload.get('job_id')
@@ -153,41 +155,64 @@ def process_smart_tts(self, payload):
         try:
             voice_id = payload.get('voice_id', '')
             sample_b64 = payload.get('sample_b64', '')
-            needs_cloning = bool(sample_b64) or (voice_id and voice_id not in ("source", "original", ""))
-
-            if needs_cloning:
-                tts_url = f"{MODAL_TTS_CLONED_URL.rstrip('/')}/tts"
-            else:
-                tts_url = f"{MODAL_TTS_FAST_URL.rstrip('/')}/tts"
+            
+            # تحديد الوضع (quality أو fast)
+            mode = 'quality' if (sample_b64 or (voice_id and voice_id not in ("source", "original", ""))) else 'fast'
 
             body = {
                 'text': payload.get('text', ''),
                 'lang': payload.get('lang', 'en'),
-                'voice_id': voice_id,
+                'mode': mode,
                 'sample_b64': sample_b64,
-                'edge_voice': payload.get('edge_voice', ''),
                 'translate': payload.get('translate', True),
                 'rate': payload.get('rate', '+0%'),
                 'pitch': payload.get('pitch', '+0Hz'),
             }
 
-            timeout = 60 if not needs_cloning else 600
-            response = requests.post(tts_url, json=body, timeout=timeout)
+            logger.info(f"[{job_id}] Sending data to Modal (sl-tts-factory)...")
+            
+            # 1️⃣ الاتصال المباشر بـ Modal عبر الـ SDK
+            tts_function = modal.Function.lookup("sl-tts-factory", "process_tts")
+            result_data = tts_function.remote(body)
 
-            if response.status_code != 200:
-                raise Exception(f"Modal HTTP {response.status_code}: {response.text[:300]}")
+            if not result_data or not result_data.get("success"):
+                error_msg = result_data.get('error', 'Unknown TTS Error from Modal') if result_data else 'Empty response from Modal'
+                raise Exception(error_msg)
 
-            result_data = response.json()
-            if not result_data.get("success"):
-                raise Exception(result_data.get('error', 'Unknown TTS Error'))
+            # 2️⃣ استخراج الصوت (Base64) من رد Modal
+            audio_base64 = result_data.get("audio_base64")
+            if not audio_base64:
+                raise Exception("Modal returned success but no audio data!")
 
-            job.output_url = result_data.get("audio_url")
-            job.extra_data = result_data.get("final_text", "")
+            audio_bytes = base64.b64decode(audio_base64)
+
+            # 3️⃣ رفع الملف الصوتي إلى Cloudflare R2
+            file_key = f"tts_results/tts_{job_id}_{int(time.time())}.mp3"
+            
+            s3_client.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=file_key,
+                Body=audio_bytes,
+                ContentType='audio/mpeg'
+            )
+
+            # 4️⃣ بناء الرابط العام للملف
+            # تأكد من إضافة R2_PUBLIC_URL في متغيرات Railway (مثل: https://pub-xxxxxx.r2.dev)
+            public_url_base = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
+            if not public_url_base:
+                raise Exception("Missing R2_PUBLIC_URL environment variable in Railway")
+                
+            output_url = f"{public_url_base}/{file_key}"
+
+            # 5️⃣ حفظ البيانات في قاعدة البيانات
+            job.output_url = output_url
+            job.extra_data = result_data.get("text_used", "")
             job.processing_time = round(time.time() - start_ts, 2)
             job.status = 'completed'
             db.session.commit()
 
-            return {"status": "done", "job_id": job_id, "audio_url": job.output_url}
+            logger.info(f"[{job_id}] ✅ TTS Completed in {job.processing_time}s")
+            return {"status": "done", "job_id": job_id, "audio_url": output_url}
 
         except Exception as e:
             _refund_and_fail(job, str(e))
