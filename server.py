@@ -1,4 +1,4 @@
-# server.py — V2.3 (معدّل لاستخدام HttpOnly cookies)
+# server.py — V2.3 (معدّل لاستخدام HttpOnly cookies + avatar upload + send-email)
 import os
 import uuid
 import json
@@ -15,6 +15,11 @@ from botocore.client import Config
 from flask import Flask, request, jsonify, Response, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
+from werkzeug.utils import secure_filename
+
+import smtplib
+from email.message import EmailMessage
+from email.utils import make_msgid
 
 from models import db, User, DubbingJob, CreditTransaction
 
@@ -37,7 +42,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
-# إعداد Cloudflare R2 Client
+# إعداد Cloudflare R2 Client (S3 compatible)
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME', 'sl-dubbing-media')
 s3_client = boto3.client(
     's3',
@@ -46,6 +51,9 @@ s3_client = boto3.client(
     aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
     config=Config(signature_version='s3v4'),
 )
+
+# إذا أردت بناء روابط عامة مباشرة (مثلاً gateway أو CDN)
+R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')  # مثال: https://<account>.r2.cloudflarestorage.com/<bucket>
 
 # Origins المسموح بها
 ALLOWED_ORIGINS = [
@@ -73,6 +81,18 @@ COOKIE_MAX_AGE = int(os.environ.get('COOKIE_MAX_AGE', 86400 * 7))  # 7 أيام 
 COOKIE_SAMESITE = os.environ.get('COOKIE_SAMESITE', 'None')  # 'Lax' أو 'Strict' أو 'None'
 COOKIE_SECURE = os.environ.get('COOKIE_SECURE', 'true').lower() in ('1', 'true', 'yes')
 COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN') or None
+
+# إعدادات SMTP (لإرسال الإيميلات)
+SMTP_HOST = os.environ.get('SMTP_HOST')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
+SMTP_USER = os.environ.get('SMTP_USER')
+SMTP_PASS = os.environ.get('SMTP_PASS')
+EMAIL_FROM = os.environ.get('EMAIL_FROM', 'no-reply@example.com')
+
+# صلاحيات الملفات المسموح بها للـ avatar
+ALLOWED_EXT = {'png', 'jpg', 'jpeg', 'webp', 'gif'}
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
 
 def _extract_voice_name(value: str) -> str:
     if not value:
@@ -165,7 +185,6 @@ def google_auth():
 
         # أعد JSON مع بيانات المستخدم فقط، وضع التوكن في HttpOnly cookie
         resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
-        # Flask set_cookie يقبل samesite كـ 'None' string في الإصدارات الحديثة
         resp.set_cookie(
             COOKIE_NAME,
             my_token,
@@ -203,6 +222,129 @@ def logout():
 def get_user_data(current_user):
     return jsonify({'success': True, 'user': current_user.to_dict()})
 
+# ---------------------------
+# Avatar upload endpoint
+# ---------------------------
+@app.route('/api/user/avatar', methods=['POST'])
+@token_required
+def upload_avatar(current_user):
+    try:
+        if 'avatar' not in request.files:
+            return jsonify({'error': 'No file'}), 400
+        f = request.files['avatar']
+        if f.filename == '' or not allowed_file(f.filename):
+            return jsonify({'error': 'Invalid file'}), 400
+
+        filename = secure_filename(f.filename)
+        key = f"avatars/{current_user.id}/{uuid.uuid4()}_{filename}"
+
+        # ارفع الملف إلى R2
+        # ملاحظة: Cloudflare R2 قد لا يدعم ACL بنفس الطريقة؛ إذا لم يعمل ExtraArgs احذفها
+        try:
+            s3_client.upload_fileobj(f, R2_BUCKET_NAME, key)
+        except Exception as e:
+            logger.warning(f"upload_fileobj with default args failed: {e}")
+            # حاول رفع بدون تغييرات إضافية
+            f.stream.seek(0)
+            s3_client.upload_fileobj(f, R2_BUCKET_NAME, key)
+
+        # بناء رابط عام: استخدم R2_PUBLIC_BASE إن وُجد، وإلا أنشئ presigned URL
+        public_url = None
+        if R2_PUBLIC_BASE:
+            # تأكد أن R2_PUBLIC_BASE لا ينتهي بشرطة مائلة زائدة
+            base = R2_PUBLIC_BASE.rstrip('/')
+            public_url = f"{base}/{key}"
+        else:
+            try:
+                public_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': R2_BUCKET_NAME, 'Key': key},
+                    ExpiresIn=3600  # رابط صالح لساعة
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate presigned URL: {e}")
+                public_url = None
+
+        if not public_url:
+            return jsonify({'error': 'Failed to create public URL for avatar'}), 500
+
+        # خزّن الرابط في قاعدة البيانات
+        current_user.avatar = public_url
+        db.session.commit()
+
+        return jsonify({'success': True, 'user': current_user.to_dict()})
+    except Exception as e:
+        logger.error(f"Avatar upload error: {e}")
+        return jsonify({'error': 'Upload failed'}), 500
+
+# ---------------------------
+# Send avatar in email (inline)
+# ---------------------------
+def send_avatar_email(user):
+    try:
+        avatar_url = user.avatar
+        if not avatar_url:
+            return {'error': 'No avatar'}
+
+        # جلب الصورة من R2 أو من الرابط المخزن
+        r = requests.get(avatar_url, timeout=15)
+        if r.status_code != 200:
+            return {'error': 'Failed to fetch avatar'}
+
+        img_data = r.content
+        # حاول استنتاج subtype من content-type
+        content_type = r.headers.get('Content-Type', 'image/png')
+        maintype, subtype = content_type.split('/', 1) if '/' in content_type else ('image', 'png')
+
+        cid = make_msgid(domain='sl-dubbing.local')
+
+        msg = EmailMessage()
+        msg['Subject'] = 'Your profile image'
+        msg['From'] = EMAIL_FROM
+        msg['To'] = user.email
+        msg.set_content(f"Hello {user.name},\n\nThis email contains your profile image.\n")
+
+        # HTML body with inline image
+        html_body = f"""\
+        <html>
+          <body>
+            <p>مرحباً {user.name},</p>
+            <p>هذه صورتك الشخصية:</p>
+            <img src="cid:{cid[1:-1]}" alt="avatar" style="max-width:300px;border-radius:8px;"/>
+          </body>
+        </html>
+        """
+        msg.add_alternative(html_body, subtype='html')
+
+        # attach image as related part
+        msg.get_payload()[1].add_related(img_data, maintype=maintype, subtype=subtype, cid=cid)
+
+        # إرسال عبر SMTP
+        if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+            logger.error("SMTP credentials not configured")
+            return {'error': 'smtp_not_configured'}
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+
+        return {'success': True}
+    except Exception as e:
+        logger.error(f"Send avatar email error: {e}")
+        return {'error': 'send_failed'}
+
+@app.route('/api/user/send-avatar-email', methods=['POST'])
+@token_required
+def send_avatar_email_endpoint(current_user):
+    res = send_avatar_email(current_user)
+    if res.get('success'):
+        return jsonify({'success': True})
+    return jsonify({'error': res.get('error', 'failed')}), 500
+
+# ---------------------------
+# بقية المسارات كما في ملفك الأصلي
+# ---------------------------
 @app.route('/api/dub', methods=['POST'])
 @token_required
 def upload_dub(current_user):
