@@ -1,4 +1,4 @@
-# models.py
+# models.py — معدّل: أضفت supabase_id، فهارس إضافية، وتحسينات بسيطة
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
@@ -10,9 +10,11 @@ db = SQLAlchemy()
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
+    # معرف Supabase (قد يكون null للحسابات غير المرتبطة)
+    supabase_id = db.Column(db.String(128), unique=True, nullable=True, index=True)
     email = db.Column(db.String(120), unique=True, nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False)
-    avatar = db.Column(db.String(500), default='👤')
+    avatar = db.Column(db.String(1000), default='👤')
     credits = db.Column(db.Integer, default=50000)
     password_hash = db.Column(db.String(255), nullable=True)
     auth_method = db.Column(db.String(50), default='oauth')
@@ -22,10 +24,10 @@ class User(db.Model):
     jobs = db.relationship('DubbingJob', backref='user', lazy=True, cascade='all, delete-orphan')
     transactions = db.relationship('CreditTransaction', backref='user', lazy=True, cascade='all, delete-orphan')
 
-    def set_password(self, password):
+    def set_password(self, password: str):
         self.password_hash = generate_password_hash(password)
 
-    def check_password(self, password):
+    def check_password(self, password: str) -> bool:
         if not self.password_hash:
             return False
         return check_password_hash(self.password_hash, password)
@@ -33,11 +35,14 @@ class User(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'supabase_id': self.supabase_id,
             'email': self.email,
             'name': self.name,
             'avatar': self.avatar,
             'credits': self.credits,
             'auth_method': self.auth_method,
+            'last_login': self.last_login.isoformat() if self.last_login else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
     def __repr__(self):
@@ -53,7 +58,7 @@ class DubbingJob(db.Model):
     voice_mode = db.Column(db.String(50), nullable=False)
     text_length = db.Column(db.Integer, default=0)
     credits_used = db.Column(db.Integer, default=0)
-    output_url = db.Column(db.String(1000), nullable=True)
+    output_url = db.Column(db.String(2000), nullable=True)
     processing_time = db.Column(db.Float, nullable=True)
     method = db.Column(db.String(50), nullable=True)
     extra_data = db.Column(db.Text, nullable=True)
