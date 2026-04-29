@@ -36,6 +36,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 # ==========================================
+
 # 2. نظام المصادقة الذكي (Supabase Middleware)
 # ==========================================
 def token_required(f):
