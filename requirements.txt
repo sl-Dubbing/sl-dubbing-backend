@@ -15,4 +15,4 @@ modal==0.62.15
 supabase==2.3.0
 f5-tts
 transformers
-accelerate
+
