@@ -1,4 +1,4 @@
-# server.py — V2.3 (معدّل لاستخدام HttpOnly cookies + avatar upload + send-email)
+# server.py — V2.4 (avatar_key, presigned generation, atomic deduction, can_send_email)
 import os
 import uuid
 import json
@@ -7,21 +7,31 @@ import time
 import base64
 import datetime as _dt
 from functools import wraps
+from io import BytesIO
 
 import jwt
 import requests
 import boto3
 from botocore.client import Config
-from flask import Flask, request, jsonify, Response, make_response
+from flask import Flask, request, jsonify, Response, make_response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
+from sqlalchemy.orm import Session
 
 import smtplib
 from email.message import EmailMessage
 from email.utils import make_msgid
 
 from models import db, User, DubbingJob, CreditTransaction
+from tasks import process_dub, process_smart_tts
+
+# Optional: Pillow for image validation
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 load_dotenv()
 
@@ -55,22 +65,13 @@ s3_client = boto3.client(
 # إذا أردت بناء روابط عامة مباشرة (مثلاً gateway أو CDN)
 R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')  # مثال: https://<account>.r2.cloudflarestorage.com/<bucket>
 
-# Origins المسموح بها
-ALLOWED_ORIGINS = [
-    "https://sl-dubbing.github.io",
-    "https://sl-dubbing-frontend.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5500",
-]
-extra_origins = os.environ.get('EXTRA_CORS_ORIGINS', '')
-if extra_origins:
-    ALLOWED_ORIGINS += [o.strip() for o in extra_origins.split(',') if o.strip()]
+# Origins المسموح بها (اقرأ من env أو استخدم القيم الافتراضية)
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS',
+                                "https://sl-dubbing.github.io,https://sl-dubbing-frontend.vercel.app,http://localhost:3000,http://localhost:5173,http://127.0.0.1:5500").split(',')
+ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
 
 # CORS مع دعم credentials لأننا نستخدم HttpOnly cookies
 CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS)
-
-from tasks import process_dub, process_smart_tts
 
 MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', 100))
 app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
@@ -93,6 +94,9 @@ EMAIL_FROM = os.environ.get('EMAIL_FROM', 'no-reply@example.com')
 ALLOWED_EXT = {'png', 'jpg', 'jpeg', 'webp', 'gif'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
+
+# حدود النص
+MAX_TTS_LENGTH = int(os.environ.get('MAX_TTS_LENGTH', 5000))
 
 def _extract_voice_name(value: str) -> str:
     if not value:
@@ -140,6 +144,41 @@ def token_required(f):
         return f(current_user, *args, **kwargs)
     return decorated
 
+# ---------------------------
+# Helper: atomic credit deduction
+# ---------------------------
+def deduct_credits_atomic(user_id: int, amount: int) -> bool:
+    """
+    Attempt to deduct credits atomically using SELECT FOR UPDATE.
+    Returns True if deduction succeeded, False if insufficient funds or error.
+    """
+    session: Session = db.session
+    try:
+        with session.begin():
+            user = session.query(User).with_for_update().filter(User.id == user_id).one_or_none()
+            if not user:
+                logger.error(f"User {user_id} not found for credit deduction")
+                return False
+            if (user.credits or 0) < amount:
+                logger.info(f"User {user_id} has insufficient credits: {user.credits} < {amount}")
+                return False
+            user.credits -= amount
+            tx = CreditTransaction(
+                user_id=user.id,
+                transaction_type='debit',
+                amount=amount,
+                reason=f'deduction {int(time.time())}'
+            )
+            session.add(tx)
+        return True
+    except Exception as e:
+        logger.error(f"Atomic deduction failed: {e}")
+        session.rollback()
+        return False
+
+# ---------------------------
+# Routes
+# ---------------------------
 @app.route('/api/auth/google', methods=['POST'])
 def google_auth():
     try:
@@ -165,7 +204,8 @@ def google_auth():
             user = User(
                 email=email,
                 name=g_data.get('name', email.split('@')[0]),
-                avatar=g_data.get('picture', '👤'),
+                avatar=None,
+                avatar_key=None,
                 auth_method='google',
                 credits=1000,
             )
@@ -220,7 +260,40 @@ def logout():
 @app.route('/api/user', methods=['GET'])
 @token_required
 def get_user_data(current_user):
-    return jsonify({'success': True, 'user': current_user.to_dict()})
+    """
+    Return user data and a valid avatar URL generated on demand.
+    Also include can_send_email flag based on SMTP config.
+    """
+    avatar_url = None
+    try:
+        # Prefer avatar_key (object key) and generate presigned or public URL
+        avatar_key = getattr(current_user, 'avatar_key', None)
+        if avatar_key:
+            if R2_PUBLIC_BASE:
+                base = R2_PUBLIC_BASE.rstrip('/')
+                avatar_url = f"{base}/{avatar_key}"
+            else:
+                try:
+                    avatar_url = s3_client.generate_presigned_url(
+                        'get_object',
+                        Params={'Bucket': R2_BUCKET_NAME, 'Key': avatar_key},
+                        ExpiresIn=3600
+                    )
+                except Exception as e:
+                    logger.warning(f"Presigned generation failed: {e}")
+                    avatar_url = None
+        # Fallback to legacy public avatar field if present
+        if not avatar_url and getattr(current_user, 'avatar', None):
+            avatar_url = current_user.avatar
+    except Exception as e:
+        logger.warning(f"Error generating avatar URL: {e}")
+        avatar_url = getattr(current_user, 'avatar', None)
+
+    user_dict = current_user.to_dict()
+    user_dict['avatar'] = avatar_url
+    # indicate whether server is configured to send emails
+    can_send = bool(SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_FROM)
+    return jsonify({'success': True, 'user': user_dict, 'can_send_email': can_send})
 
 # ---------------------------
 # Avatar upload endpoint
@@ -235,64 +308,95 @@ def upload_avatar(current_user):
         if f.filename == '' or not allowed_file(f.filename):
             return jsonify({'error': 'Invalid file'}), 400
 
+        # Optional: validate image content
+        f.stream.seek(0)
+        file_bytes = f.read()
+        if PIL_AVAILABLE:
+            try:
+                img = Image.open(BytesIO(file_bytes))
+                img.verify()
+            except Exception:
+                return jsonify({'error': 'Invalid image file'}), 400
+
+        # Reset stream for upload
+        file_stream = BytesIO(file_bytes)
         filename = secure_filename(f.filename)
         key = f"avatars/{current_user.id}/{uuid.uuid4()}_{filename}"
 
-        # ارفع الملف إلى R2
-        # ملاحظة: Cloudflare R2 قد لا يدعم ACL بنفس الطريقة؛ إذا لم يعمل ExtraArgs احذفها
+        # Upload to R2
         try:
-            s3_client.upload_fileobj(f, R2_BUCKET_NAME, key)
+            s3_client.upload_fileobj(file_stream, R2_BUCKET_NAME, key)
         except Exception as e:
-            logger.warning(f"upload_fileobj with default args failed: {e}")
-            # حاول رفع بدون تغييرات إضافية
-            f.stream.seek(0)
-            s3_client.upload_fileobj(f, R2_BUCKET_NAME, key)
-
-        # بناء رابط عام: استخدم R2_PUBLIC_BASE إن وُجد، وإلا أنشئ presigned URL
-        public_url = None
-        if R2_PUBLIC_BASE:
-            # تأكد أن R2_PUBLIC_BASE لا ينتهي بشرطة مائلة زائدة
-            base = R2_PUBLIC_BASE.rstrip('/')
-            public_url = f"{base}/{key}"
-        else:
+            logger.warning(f"upload_fileobj failed: {e}")
+            # try resetting stream and retry
             try:
-                public_url = s3_client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': R2_BUCKET_NAME, 'Key': key},
-                    ExpiresIn=3600  # رابط صالح لساعة
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate presigned URL: {e}")
-                public_url = None
+                file_stream.seek(0)
+                s3_client.upload_fileobj(file_stream, R2_BUCKET_NAME, key)
+            except Exception as e2:
+                logger.error(f"Second upload attempt failed: {e2}")
+                return jsonify({'error': 'Upload failed'}), 500
 
-        if not public_url:
-            return jsonify({'error': 'Failed to create public URL for avatar'}), 500
-
-        # خزّن الرابط في قاعدة البيانات
-        current_user.avatar = public_url
+        # Store the object key in DB (do NOT store presigned URL)
+        current_user.avatar_key = key
+        # Optionally clear legacy public avatar field
+        current_user.avatar = None
         db.session.commit()
 
-        return jsonify({'success': True, 'user': current_user.to_dict()})
+        # Return user with generated avatar URL
+        avatar_url = None
+        if R2_PUBLIC_BASE:
+            avatar_url = f"{R2_PUBLIC_BASE.rstrip('/')}/{key}"
+        else:
+            try:
+                avatar_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': R2_BUCKET_NAME, 'Key': key},
+                    ExpiresIn=3600
+                )
+            except Exception as e:
+                logger.warning(f"Presigned generation after upload failed: {e}")
+                avatar_url = None
+
+        user_dict = current_user.to_dict()
+        user_dict['avatar'] = avatar_url
+        return jsonify({'success': True, 'user': user_dict})
     except Exception as e:
         logger.error(f"Avatar upload error: {e}")
         return jsonify({'error': 'Upload failed'}), 500
 
 # ---------------------------
-# Send avatar in email (inline)
+# Send avatar in email (inline) - uses SMTP if configured
 # ---------------------------
 def send_avatar_email(user):
     try:
-        avatar_url = user.avatar
+        avatar_key = getattr(user, 'avatar_key', None)
+        avatar_url = None
+        if avatar_key:
+            if R2_PUBLIC_BASE:
+                avatar_url = f"{R2_PUBLIC_BASE.rstrip('/')}/{avatar_key}"
+            else:
+                try:
+                    avatar_url = s3_client.generate_presigned_url(
+                        'get_object',
+                        Params={'Bucket': R2_BUCKET_NAME, 'Key': avatar_key},
+                        ExpiresIn=3600
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to generate presigned for email: {e}")
+                    avatar_url = None
+        # fallback to legacy avatar
+        if not avatar_url and getattr(user, 'avatar', None):
+            avatar_url = user.avatar
+
         if not avatar_url:
             return {'error': 'No avatar'}
 
-        # جلب الصورة من R2 أو من الرابط المخزن
+        # fetch image bytes
         r = requests.get(avatar_url, timeout=15)
         if r.status_code != 200:
             return {'error': 'Failed to fetch avatar'}
 
         img_data = r.content
-        # حاول استنتاج subtype من content-type
         content_type = r.headers.get('Content-Type', 'image/png')
         maintype, subtype = content_type.split('/', 1) if '/' in content_type else ('image', 'png')
 
@@ -304,7 +408,6 @@ def send_avatar_email(user):
         msg['To'] = user.email
         msg.set_content(f"Hello {user.name},\n\nThis email contains your profile image.\n")
 
-        # HTML body with inline image
         html_body = f"""\
         <html>
           <body>
@@ -315,11 +418,8 @@ def send_avatar_email(user):
         </html>
         """
         msg.add_alternative(html_body, subtype='html')
-
-        # attach image as related part
         msg.get_payload()[1].add_related(img_data, maintype=maintype, subtype=subtype, cid=cid)
 
-        # إرسال عبر SMTP
         if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
             logger.error("SMTP credentials not configured")
             return {'error': 'smtp_not_configured'}
@@ -343,21 +443,35 @@ def send_avatar_email_endpoint(current_user):
     return jsonify({'error': res.get('error', 'failed')}), 500
 
 # ---------------------------
-# بقية المسارات كما في ملفك الأصلي
+# Upload dubbing (uses atomic deduction)
 # ---------------------------
 @app.route('/api/dub', methods=['POST'])
 @token_required
 def upload_dub(current_user):
     try:
         cost = int(os.environ.get('DUB_COST', 100))
-        if (current_user.credits or 0) < cost:
+        if not deduct_credits_atomic(current_user.id, cost):
             return jsonify({"error": "رصيد غير كافٍ"}), 402
 
         if 'media_file' not in request.files:
+            # refund
+            session = db.session
+            with session.begin():
+                user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
+                if user:
+                    user.credits += cost
+                    session.add(CreditTransaction(user_id=user.id, transaction_type='credit', amount=cost, reason='refund missing file'))
             return jsonify({"error": "يرجى اختيار ملف"}), 400
 
         file = request.files['media_file']
         if not file or not file.filename:
+            # refund
+            session = db.session
+            with session.begin():
+                user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
+                if user:
+                    user.credits += cost
+                    session.add(CreditTransaction(user_id=user.id, transaction_type='credit', amount=cost, reason='refund invalid file'))
             return jsonify({"error": "ملف غير صالح"}), 400
 
         safe_name = f"{uuid.uuid4()}_{os.path.basename(file.filename)}"
@@ -385,7 +499,6 @@ def upload_dub(current_user):
             method='dubbing',
         )
 
-        current_user.credits -= cost
         db.session.add(job)
         db.session.add(CreditTransaction(
             user_id=current_user.id,
@@ -402,7 +515,29 @@ def upload_dub(current_user):
             'voice_id': voice_name,
             'sample_b64': sample_b64,
         }
-        process_dub.delay(payload)
+        # dispatch background task (handle both Celery and Modal style)
+        try:
+            if hasattr(process_dub, 'delay'):
+                process_dub.delay(payload)
+            elif hasattr(process_dub, 'spawn'):
+                process_dub.spawn(payload)
+            else:
+                process_dub(payload)
+        except Exception as e:
+            logger.error(f"Failed to dispatch process_dub: {e}")
+            # mark job failed and refund
+            try:
+                job.status = 'failed'
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            session = db.session
+            with session.begin():
+                user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
+                if user:
+                    user.credits += cost
+                    session.add(CreditTransaction(user_id=user.id, transaction_type='credit', amount=cost, reason=f'refund dispatch failure {job.id}'))
+            return jsonify({"error": "فشل توجيه المهمة"}), 500
 
         return jsonify({"success": True, "job_id": job.id})
 
@@ -410,6 +545,9 @@ def upload_dub(current_user):
         logger.error(f"Upload Error: {e}")
         return jsonify({"error": "حدث خطأ أثناء الرفع للسحابة"}), 500
 
+# ---------------------------
+# Upload TTS (high quality) with atomic deduction
+# ---------------------------
 @app.route('/api/tts', methods=['POST'])
 @token_required
 def upload_tts(current_user):
@@ -423,9 +561,11 @@ def upload_tts(current_user):
 
         if not text:
             return jsonify({"error": "النص فارغ"}), 400
+        if len(text) > MAX_TTS_LENGTH:
+            return jsonify({"error": f"النص طويل جداً (الحد {MAX_TTS_LENGTH} حرف)"}), 400
 
         cost = max(10, (len(text) // 100) * 10)
-        if (current_user.credits or 0) < cost:
+        if not deduct_credits_atomic(current_user.id, cost):
             return jsonify({"error": "رصيد غير كافٍ"}), 402
 
         job = DubbingJob(
@@ -439,7 +579,6 @@ def upload_tts(current_user):
             method='tts',
         )
 
-        current_user.credits -= cost
         db.session.add(job)
         db.session.add(CreditTransaction(
             user_id=current_user.id,
@@ -456,7 +595,28 @@ def upload_tts(current_user):
             'voice_id': voice_name,
             'sample_b64': sample_b64,
         }
-        process_smart_tts.delay(payload)
+        try:
+            if hasattr(process_smart_tts, 'delay'):
+                process_smart_tts.delay(payload)
+            elif hasattr(process_smart_tts, 'spawn'):
+                process_smart_tts.spawn(payload)
+            else:
+                process_smart_tts(payload)
+        except Exception as e:
+            logger.error(f"Failed to dispatch smart tts: {e}")
+            try:
+                job.status = 'failed'
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            # refund
+            session = db.session
+            with session.begin():
+                user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
+                if user:
+                    user.credits += cost
+                    session.add(CreditTransaction(user_id=user.id, transaction_type='credit', amount=cost, reason=f'refund dispatch failure {job.id}'))
+            return jsonify({"error": "فشل توجيه المهمة"}), 500
 
         return jsonify({"success": True, "job_id": job.id})
 
@@ -464,6 +624,9 @@ def upload_tts(current_user):
         logger.error(f"TTS Error: {e}")
         return jsonify({"error": "حدث خطأ أثناء معالجة النص"}), 500
 
+# ---------------------------
+# Get job
+# ---------------------------
 @app.route('/api/job/<job_id>', methods=['GET'])
 @token_required
 def get_job(current_user, job_id):
@@ -483,6 +646,9 @@ def get_job(current_user, job_id):
         'updated_at': job.updated_at.isoformat() if job.updated_at else None,
     })
 
+# ---------------------------
+# Quick TTS via Modal fast stream (atomic deduction)
+# ---------------------------
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
 def tts_quick(current_user):
@@ -491,17 +657,12 @@ def tts_quick(current_user):
         text = (data.get('text') or '').strip()
         if not text:
             return jsonify({"error": "النص فارغ"}), 400
+        if len(text) > MAX_TTS_LENGTH:
+            return jsonify({"error": f"النص طويل جداً (الحد {MAX_TTS_LENGTH} حرف)"}), 400
+
         cost = max(5, len(text) // 200 * 5)
-        if (current_user.credits or 0) < cost:
+        if not deduct_credits_atomic(current_user.id, cost):
             return jsonify({"error": "رصيد غير كافٍ"}), 402
-        current_user.credits -= cost
-        db.session.add(CreditTransaction(
-            user_id=current_user.id,
-            transaction_type='debit',
-            amount=cost,
-            reason='Quick TTS',
-        ))
-        db.session.commit()
 
         modal_fast_url = os.environ.get(
             'MODAL_TTS_FAST_URL',
@@ -523,8 +684,13 @@ def tts_quick(current_user):
         )
 
         if modal_response.status_code != 200:
-            current_user.credits += cost
-            db.session.commit()
+            # refund
+            session = db.session
+            with session.begin():
+                user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
+                if user:
+                    user.credits += cost
+                    session.add(CreditTransaction(user_id=user.id, transaction_type='credit', amount=cost, reason='refund modal error'))
             return jsonify({"error": f"Modal error: {modal_response.status_code}"}), 500
 
         def generate():
@@ -550,6 +716,9 @@ def tts_quick(current_user):
         logger.error(f"Quick TTS Error: {e}")
         return jsonify({"error": "خطأ أثناء التوليد"}), 500
 
+# ---------------------------
+# Progress SSE
+# ---------------------------
 @app.route('/api/progress/<job_id>')
 def get_progress(job_id):
     def generate():
@@ -570,6 +739,9 @@ def get_progress(job_id):
             time.sleep(2)
     return Response(generate(), mimetype='text/event-stream')
 
+# ---------------------------
+# Health & root
+# ---------------------------
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok', 'time': int(time.time())})
@@ -581,6 +753,9 @@ def root():
         'status': 'running',
     })
 
+# ---------------------------
+# Run
+# ---------------------------
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
