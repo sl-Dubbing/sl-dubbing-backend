@@ -1,10 +1,10 @@
 import os
-import jwt
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from functools import wraps
+from supabase import create_client, Client
 
-# استيراد قاعدة البيانات والجداول وملف المهام الخاص بك
+# استيراد قاعدة البيانات والجداول وملف المهام
 from models import db, User, DubbingJob
 from tasks import process_smart_tts
 
@@ -13,9 +13,8 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ==========================================
-# 1. إعدادات قاعدة البيانات (نفس إعدادات العامل)
+# 1. إعدادات قاعدة البيانات و Supabase
 # ==========================================
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-super-secret-key')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
@@ -26,8 +25,18 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # تهيئة قاعدة البيانات مع التطبيق
 db.init_app(app)
 
+# تهيئة عميل Supabase
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("⚠️ تحذير: مفاتيح Supabase غير موجودة في بيئة التشغيل!")
+
+# إنشاء نقطة الاتصال مع خوادم Supabase
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
 # ==========================================
-# 2. نظام المصادقة (Middleware)
+# 2. نظام المصادقة الذكي (Supabase Middleware)
 # ==========================================
 def token_required(f):
     @wraps(f)
@@ -38,26 +47,38 @@ def token_required(f):
             token = auth_header.split(" ")[1] if "Bearer" in auth_header else auth_header
 
         if not token:
-            return jsonify({'success': False, 'message': 'التوكن مفقود!'}), 401
+            return jsonify({'success': False, 'message': 'التوكن مفقود! يرجى تسجيل الدخول.'}), 401
 
         try:
-            # محاولة فك تشفير التوكن (JWT)
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            current_user = User.query.get(data['user_id'])
+            # 1. التحقق من صحة التوكن عبر خوادم Supabase
+            user_response = supabase.auth.get_user(token)
+            supabase_user = user_response.user
+
+            if not supabase_user:
+                return jsonify({'success': False, 'message': 'توكن غير صالح!'}), 401
+
+            # 2. البحث عن المستخدم في قاعدة بياناتنا المحلية في Railway
+            current_user = User.query.filter_by(supabase_id=supabase_user.id).first()
+
+            # 3. إذا كان المستخدم جديداً (سجل للتو)، ننشئ له حساباً لدينا فوراً
             if not current_user:
-                raise Exception("المستخدم غير موجود")
+                current_user = User(
+                    supabase_id=supabase_user.id,
+                    email=supabase_user.email,
+                    credits=100  # اعطائه 100 نقطة مجانية كبداية
+                )
+                db.session.add(current_user)
+                db.session.commit()
+
         except Exception as e:
-            # (للتجربة حالياً: إذا فشل التوكن، سنجلب أول مستخدم في قاعدة البيانات لتجنب تعطل العمل)
-            # يمكنك إزالة هذه المساعدة لاحقاً عندما تتأكد من عمل نظام تسجيل الدخول 100%
-            current_user = User.query.first()
-            if not current_user:
-                return jsonify({'success': False, 'message': 'توكن غير صالح ولا يوجد مستخدمين!'}), 401
+            print(f"❌ Auth Error: {e}")
+            return jsonify({'success': False, 'message': 'جلسة غير صالحة، يرجى تسجيل الدخول مجدداً.'}), 401
 
         return f(current_user, *args, **kwargs)
     return decorated
 
 # ==========================================
-# 3. مسارات الـ API
+# 3. مسارات الـ API (محمية بالكامل)
 # ==========================================
 
 # أ. جلب بيانات المستخدم للشريط الجانبي
@@ -68,9 +89,8 @@ def get_user(current_user):
         'success': True, 
         'user': {
             'id': current_user.id,
-            # إذا لم يكن الحقل 'name' موجوداً، استخدم اسماً افتراضياً
-            'name': getattr(current_user, 'name', 'مستخدم'), 
-            'credits': getattr(current_user, 'credits', 0)
+            'email': current_user.email, 
+            'credits': current_user.credits
         }
     })
 
@@ -83,19 +103,16 @@ def start_tts(current_user):
         return jsonify({"success": False, "error": "النص غير موجود"})
 
     # التحقق من الرصيد
-    if getattr(current_user, 'credits', 0) <= 0:
+    if current_user.credits <= 0:
         return jsonify({"success": False, "error": "رصيدك غير كافٍ"})
 
     try:
-        # 1. إنشاء مهمة في قاعدة البيانات (حالتها: جاري المعالجة)
-        new_job = DubbingJob(
-            user_id=current_user.id,
-            status='processing'
-        )
+        # إنشاء مهمة في قاعدة البيانات
+        new_job = DubbingJob(user_id=current_user.id, status='processing')
         db.session.add(new_job)
         db.session.commit()
 
-        # 2. تجهيز البيانات التي سيأخذها العامل (Worker)
+        # تجهيز البيانات للعامل (Worker)
         payload = {
             'job_id': new_job.id,
             'text': data['text'],
@@ -108,10 +125,9 @@ def start_tts(current_user):
             'pitch': data.get('pitch', '+0Hz')
         }
 
-        # 3. إرسال المهمة إلى Celery (ليقوم tasks.py بمعالجتها)
+        # إرسال المهمة إلى Celery
         process_smart_tts.delay(payload)
 
-        # 4. إرجاع رقم المهمة للواجهة (frontend)
         return jsonify({"success": True, "job_id": new_job.id})
 
     except Exception as e:
@@ -119,7 +135,7 @@ def start_tts(current_user):
         print(f"❌ Error starting TTS job: {e}")
         return jsonify({"success": False, "error": "حدث خطأ أثناء إرسال العملية."})
 
-# ج. فحص حالة المهمة (Polling)
+# ج. فحص حالة المهمة
 @app.route('/api/job/<job_id>', methods=['GET'])
 @token_required
 def check_job(current_user, job_id):
@@ -129,16 +145,14 @@ def check_job(current_user, job_id):
         if not job:
             return jsonify({"status": "failed", "error": "المهمة غير موجودة"})
 
-        # إذا نجح Celery في إكمالها ووضع الرابط
+        # التأكد من أن المهمة تخص المستخدم نفسه (أمان إضافي)
+        if job.user_id != current_user.id:
+            return jsonify({"status": "failed", "error": "غير مصرح لك بمشاهدة هذه المهمة"})
+
         if job.status == 'completed':
             return jsonify({"status": "completed", "audio_url": job.output_url})
-            
-        # إذا فشل Celery
         elif job.status == 'failed':
-            # يمكنك إضافة job.extra_data أو حقل الخطأ إذا كنت تخزنه
             return jsonify({"status": "failed", "error": "فشلت المعالجة"})
-            
-        # لا تزال قيد المعالجة
         else:
             return jsonify({"status": "processing"})
 
