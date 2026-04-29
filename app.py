@@ -4,8 +4,8 @@ from flask_cors import CORS
 from functools import wraps
 from supabase import create_client, Client
 
-# استيراد قاعدة البيانات والجداول وملف المهام
-from models import db, User, DubbingJob
+# استيراد قاعدة البيانات والجداول وملف المهام الخاص بك
+from models import db, User, DubbingJob, CreditTransaction
 from tasks import process_smart_tts
 
 app = Flask(__name__)
@@ -57,17 +57,30 @@ def token_required(f):
             if not supabase_user:
                 return jsonify({'success': False, 'message': 'توكن غير صالح!'}), 401
 
-            # 2. البحث عن المستخدم في قاعدة بياناتنا المحلية في Railway
+            # 2. البحث عن المستخدم في قاعدة بياناتنا المحلية
             current_user = User.query.filter_by(supabase_id=supabase_user.id).first()
 
-            # 3. إذا كان المستخدم جديداً (سجل للتو)، ننشئ له حساباً لدينا فوراً
+            # 3. إنشاء حساب تلقائي للمستخدم الجديد بـ 50,000 نقطة
             if not current_user:
                 current_user = User(
                     supabase_id=supabase_user.id,
                     email=supabase_user.email,
-                    credits=100  # اعطائه 100 نقطة مجانية كبداية
+                    name=supabase_user.user_metadata.get('full_name', 'مستخدم جديد'),
+                    avatar=supabase_user.user_metadata.get('avatar_url', '👤'),
+                    credits=50000,
+                    auth_method='supabase'
                 )
                 db.session.add(current_user)
+                
+                # توثيق عملية منح النقاط الترحيبية
+                db.session.flush() # للحصول على id المستخدم قبل الكوميت
+                welcome_transaction = CreditTransaction(
+                    user_id=current_user.id,
+                    transaction_type='bonus',
+                    amount=50000,
+                    reason='نقاط ترحيبية للتسجيل الجديد'
+                )
+                db.session.add(welcome_transaction)
                 db.session.commit()
 
         except Exception as e:
@@ -87,11 +100,7 @@ def token_required(f):
 def get_user(current_user):
     return jsonify({
         'success': True, 
-        'user': {
-            'id': current_user.id,
-            'email': current_user.email, 
-            'credits': current_user.credits
-        }
+        'user': current_user.to_dict()
     })
 
 # ب. إرسال طلب التوليد (يرسل المهمة إلى Celery)
@@ -107,14 +116,20 @@ def start_tts(current_user):
         return jsonify({"success": False, "error": "رصيدك غير كافٍ"})
 
     try:
-        # إنشاء مهمة في قاعدة البيانات
-        new_job = DubbingJob(user_id=current_user.id, status='processing')
+        # إنشاء المهمة في قاعدة البيانات وربطها بالمستخدم
+        new_job = DubbingJob(
+            user_id=current_user.id, 
+            status='pending',
+            language=data.get('lang', 'en'),
+            voice_mode=data.get('voice_id', 'default'),
+            text_length=len(data['text'])
+        )
         db.session.add(new_job)
         db.session.commit()
 
-        # تجهيز البيانات للعامل (Worker)
+        # تجهيز البيانات للعامل (Worker) - نرسل الـ UUID كنص
         payload = {
-            'job_id': new_job.id,
+            'job_id': str(new_job.id),
             'text': data['text'],
             'lang': data.get('lang', 'en'),
             'voice_id': data.get('voice_id', ''),
@@ -128,7 +143,7 @@ def start_tts(current_user):
         # إرسال المهمة إلى Celery
         process_smart_tts.delay(payload)
 
-        return jsonify({"success": True, "job_id": new_job.id})
+        return jsonify({"success": True, "job_id": str(new_job.id)})
 
     except Exception as e:
         db.session.rollback()
@@ -145,16 +160,11 @@ def check_job(current_user, job_id):
         if not job:
             return jsonify({"status": "failed", "error": "المهمة غير موجودة"})
 
-        # التأكد من أن المهمة تخص المستخدم نفسه (أمان إضافي)
+        # التأكد من أن المهمة تخص المستخدم نفسه (أمان)
         if job.user_id != current_user.id:
             return jsonify({"status": "failed", "error": "غير مصرح لك بمشاهدة هذه المهمة"})
 
-        if job.status == 'completed':
-            return jsonify({"status": "completed", "audio_url": job.output_url})
-        elif job.status == 'failed':
-            return jsonify({"status": "failed", "error": "فشلت المعالجة"})
-        else:
-            return jsonify({"status": "processing"})
+        return jsonify(job.to_dict())
 
     except Exception as e:
         print(f"❌ Job Check Error: {e}")
