@@ -1,4 +1,3 @@
-# app.py — V4.1 (Merged Gateway & Server - Async Fixed & Dubbing Restored)
 import os
 import time
 import base64
@@ -16,7 +15,6 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-# حماية (Rate Limiting)
 try:
     from flask_limiter import Limiter
     from flask_limiter.util import get_remote_address
@@ -26,15 +24,11 @@ except Exception:
 
 import edge_tts
 
-# استيراد النماذج والمهام من مشروعك
 from models import db, User, DubbingJob, CreditTransaction
 from tasks import process_smart_tts, process_dub
 
 load_dotenv()
 
-# ---------------------------
-# الإعدادات الأساسية
-# ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("gateway")
 
@@ -51,7 +45,6 @@ if LIMITER_AVAILABLE:
 else:
     limiter = None
 
-# إعداد قاعدة البيانات
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
@@ -62,7 +55,6 @@ db.init_app(app)
 SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET')
 MAX_TTS_LENGTH = int(os.environ.get('MAX_TTS_LENGTH', 5000))
 
-# إعداد Cloudflare R2 Client (تمت إعادته لدعم رفع الفيديوهات)
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 s3_client = boto3.client(
     's3',
@@ -73,9 +65,6 @@ s3_client = boto3.client(
 )
 R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')
 
-# ---------------------------
-# دوال المساعدة والمصادقة
-# ---------------------------
 def json_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -136,9 +125,6 @@ def deduct_credits_atomic(user_id: int, amount: int) -> bool:
         logger.error(f"Credit Deduction Error: {e}")
         return False
 
-# ---------------------------
-# المسارات (Routes)
-# ---------------------------
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({"status": "ok", "message": "Gateway Online"}), 200
@@ -151,9 +137,6 @@ def get_user(current_user):
         user_dict['avatar'] = f"{R2_PUBLIC_BASE.rstrip('/')}/{current_user.avatar_key}"
     return jsonify({'success': True, 'user': user_dict}), 200
 
-# ---------------------------
-# 1. مسار الدبلجة (تمت إعادته)
-# ---------------------------
 @app.route('/api/dubbing', methods=['POST'])
 @token_required
 def start_dubbing_route(current_user):
@@ -163,11 +146,9 @@ def start_dubbing_route(current_user):
 
     file = request.files.get('media_file')
     if not file: 
-        # إرجاع الرصيد في حال عدم وجود ملف
         deduct_credits_atomic(current_user.id, -cost)
         return jsonify({"error": "لم يتم رفع ملف"}), 400
 
-    # رفع الفيديو إلى R2
     file_key = f"uploads/{uuid.uuid4()}_{secure_filename(file.filename)}"
     s3_client.upload_fileobj(file, R2_BUCKET_NAME, file_key)
 
@@ -181,7 +162,6 @@ def start_dubbing_route(current_user):
     db.session.add(new_job)
     db.session.commit()
 
-    # الإرسال لـ Worker
     process_dub.delay({
         'job_id': new_job.id,
         'file_key': file_key,
@@ -192,9 +172,6 @@ def start_dubbing_route(current_user):
 
     return jsonify({"success": True, "job_id": new_job.id})
 
-# ---------------------------
-# 2. مسار التوليد السريع (Edge-TTS)
-# ---------------------------
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
 @json_required
@@ -239,9 +216,6 @@ def quick_tts(current_user):
     response.headers['Access-Control-Expose-Headers'] = 'X-Remaining-Credits'
     return response
 
-# ---------------------------
-# 3. مسار التوليد الذكي (Modal)
-# ---------------------------
 @app.route('/api/tts/smart', methods=['POST'])
 @token_required
 @json_required
