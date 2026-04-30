@@ -11,3 +11,4 @@ supabase==2.3.0
 Pillow==10.2.0
 celery==5.3.6
 redis==5.0.1
+modal==0.62.15
