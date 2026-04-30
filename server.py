@@ -1,4 +1,4 @@
-# server.py — V2.4 (avatar_key, presigned generation, atomic deduction, can_send_email)
+# server.py — V2.5 (Supabase Auth Integration)
 import os
 import uuid
 import json
@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # الإعدادات الأساسية
 # ==========================================
+# مفتاح Supabase الجديد لفك تشفير التوكن
+SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET')
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
@@ -62,40 +64,34 @@ s3_client = boto3.client(
     config=Config(signature_version='s3v4'),
 )
 
-# إذا أردت بناء روابط عامة مباشرة (مثلاً gateway أو CDN)
-R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')  # مثال: https://<account>.r2.cloudflarestorage.com/<bucket>
+R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')
 
-# Origins المسموح بها (اقرأ من env أو استخدم القيم الافتراضية)
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS',
                                 "https://sl-dubbing.github.io,https://sl-dubbing-frontend.vercel.app,http://localhost:3000,http://localhost:5173,http://127.0.0.1:5500").split(',')
 ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
 
-# CORS مع دعم credentials لأننا نستخدم HttpOnly cookies
 CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS)
 
 MAX_UPLOAD_MB = int(os.environ.get('MAX_UPLOAD_MB', 100))
 app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 
-# إعدادات الكوكي من env
 COOKIE_NAME = os.environ.get('COOKIE_NAME', 'session')
-COOKIE_MAX_AGE = int(os.environ.get('COOKIE_MAX_AGE', 86400 * 7))  # 7 أيام افتراضياً
-COOKIE_SAMESITE = os.environ.get('COOKIE_SAMESITE', 'None')  # 'Lax' أو 'Strict' أو 'None'
+COOKIE_MAX_AGE = int(os.environ.get('COOKIE_MAX_AGE', 86400 * 7))
+COOKIE_SAMESITE = os.environ.get('COOKIE_SAMESITE', 'None')
 COOKIE_SECURE = os.environ.get('COOKIE_SECURE', 'true').lower() in ('1', 'true', 'yes')
 COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN') or None
 
-# إعدادات SMTP (لإرسال الإيميلات)
+# إعدادات SMTP
 SMTP_HOST = os.environ.get('SMTP_HOST')
 SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
 SMTP_USER = os.environ.get('SMTP_USER')
 SMTP_PASS = os.environ.get('SMTP_PASS')
 EMAIL_FROM = os.environ.get('EMAIL_FROM', 'no-reply@example.com')
 
-# صلاحيات الملفات المسموح بها للـ avatar
 ALLOWED_EXT = {'png', 'jpg', 'jpeg', 'webp', 'gif'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
 
-# حدود النص
 MAX_TTS_LENGTH = int(os.environ.get('MAX_TTS_LENGTH', 5000))
 
 def _extract_voice_name(value: str) -> str:
@@ -115,6 +111,9 @@ def _extract_voice_name(value: str) -> str:
             return "source"
     return v
 
+# ==========================================
+# دالة التحقق من التوكن (محدثة لـ Supabase)
+# ==========================================
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -125,22 +124,53 @@ def token_required(f):
             if len(parts) == 2 and parts[0].lower() == 'bearer':
                 token = parts[1]
 
-        # fallback: read from HttpOnly cookie
         if not token:
             token = request.cookies.get(COOKIE_NAME)
 
         if not token:
             return jsonify({'error': 'Unauthorized'}), 401
+            
         try:
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            current_user = User.query.get(data['user_id'])
+            if not SUPABASE_JWT_SECRET:
+                logger.error("SUPABASE_JWT_SECRET is missing from environment variables!")
+                raise Exception("Server configuration error")
+
+            # فك تشفير التوكن الخاص بـ Supabase
+            data = jwt.decode(
+                token, 
+                SUPABASE_JWT_SECRET, 
+                algorithms=["HS256"], 
+                audience="authenticated"
+            )
+            
+            # جلب الإيميل من التوكن
+            email = data.get('email')
+            if not email:
+                return jsonify({'error': 'Token missing email'}), 401
+
+            # البحث عن المستخدم في قاعدة بياناتنا أو إنشاؤه إذا كان جديداً
+            current_user = User.query.filter_by(email=email).first()
             if not current_user:
-                raise Exception("User not found")
+                user_metadata = data.get('user_metadata', {})
+                name = user_metadata.get('name', user_metadata.get('full_name', email.split('@')[0]))
+                avatar_url = user_metadata.get('avatar_url')
+
+                current_user = User(
+                    email=email,
+                    name=name,
+                    avatar=avatar_url,
+                    auth_method='supabase',
+                    credits=1000,
+                )
+                db.session.add(current_user)
+                db.session.commit()
+
         except jwt.ExpiredSignatureError:
             return jsonify({'error': 'Token expired'}), 401
         except Exception as e:
             logger.warning(f"Token decode error: {e}")
             return jsonify({'error': 'Invalid token'}), 401
+            
         return f(current_user, *args, **kwargs)
     return decorated
 
@@ -148,19 +178,13 @@ def token_required(f):
 # Helper: atomic credit deduction
 # ---------------------------
 def deduct_credits_atomic(user_id: int, amount: int) -> bool:
-    """
-    Attempt to deduct credits atomically using SELECT FOR UPDATE.
-    Returns True if deduction succeeded, False if insufficient funds or error.
-    """
     session: Session = db.session
     try:
         with session.begin():
             user = session.query(User).with_for_update().filter(User.id == user_id).one_or_none()
             if not user:
-                logger.error(f"User {user_id} not found for credit deduction")
                 return False
             if (user.credits or 0) < amount:
-                logger.info(f"User {user_id} has insufficient credits: {user.credits} < {amount}")
                 return False
             user.credits -= amount
             tx = CreditTransaction(
@@ -179,94 +203,34 @@ def deduct_credits_atomic(user_id: int, amount: int) -> bool:
 # ---------------------------
 # Routes
 # ---------------------------
+# هذه النهاية الطرفية (Endpoint) أصبحت تعمل كنقطة "مزامنة" للواجهة الأمامية
 @app.route('/api/auth/google', methods=['POST'])
-def google_auth():
+@token_required
+def google_auth(current_user):
+    """
+    بما أن الواجهة الأمامية تتعامل مع Supabase للحصول على التوكن، 
+    هذا الرابط يتأكد فقط من مزامنة المستخدم وإرجاع بياناته.
+    """
     try:
-        data = request.json or {}
-        google_token = data.get('credential')
-        if not google_token:
-            return jsonify({'error': 'No credential provided'}), 400
-
-        google_res = requests.get(
-            f"https://oauth2.googleapis.com/tokeninfo?id_token={google_token}",
-            timeout=10,
-        )
-        if google_res.status_code != 200:
-            return jsonify({'error': 'فشل التحقق من حساب جوجل'}), 401
-
-        g_data = google_res.json()
-        email = g_data.get('email')
-        if not email:
-            return jsonify({'error': 'Email not found in Google response'}), 400
-
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            user = User(
-                email=email,
-                name=g_data.get('name', email.split('@')[0]),
-                avatar=None,
-                avatar_key=None,
-                auth_method='google',
-                credits=1000,
-            )
-            db.session.add(user)
-            db.session.commit()
-        else:
-            user.last_login = _dt.datetime.utcnow()
-            db.session.commit()
-
-        # أنشئ JWT قصير العمر (مثال: 1 يوم)
-        token_exp = int(time.time()) + (86400 * 1)
-        my_token = jwt.encode(
-            {'user_id': user.id, 'exp': token_exp},
-            app.config['SECRET_KEY'],
-            algorithm="HS256",
-        )
-
-        # أعد JSON مع بيانات المستخدم فقط، وضع التوكن في HttpOnly cookie
-        resp = make_response(jsonify({'success': True, 'user': user.to_dict()}))
-        resp.set_cookie(
-            COOKIE_NAME,
-            my_token,
-            max_age=COOKIE_MAX_AGE,
-            httponly=True,
-            secure=COOKIE_SECURE,
-            samesite=COOKIE_SAMESITE,
-            path='/',
-            domain=COOKIE_DOMAIN
-        )
-        return resp
-
+        current_user.last_login = _dt.datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'user': current_user.to_dict()})
     except Exception as e:
-        logger.error(f"Google Auth Error: {e}")
-        return jsonify({'error': 'حدث خطأ في السيرفر أثناء تسجيل الدخول'}), 500
+        logger.error(f"Auth Sync Error: {e}")
+        return jsonify({'error': 'حدث خطأ في السيرفر أثناء المزامنة'}), 500
 
 @app.route('/api/logout', methods=['POST'])
 def logout():
+    # Supabase يتعامل مع تسجيل الخروج في الواجهة الأمامية، لكننا نمسح الكوكيز احتياطياً
     resp = make_response(jsonify({'success': True}))
-    resp.set_cookie(
-        COOKIE_NAME,
-        '',
-        expires=0,
-        max_age=0,
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite=COOKIE_SAMESITE,
-        path='/',
-        domain=COOKIE_DOMAIN
-    )
+    resp.set_cookie(COOKIE_NAME, '', expires=0, max_age=0, path='/')
     return resp
 
 @app.route('/api/user', methods=['GET'])
 @token_required
 def get_user_data(current_user):
-    """
-    Return user data and a valid avatar URL generated on demand.
-    Also include can_send_email flag based on SMTP config.
-    """
     avatar_url = None
     try:
-        # Prefer avatar_key (object key) and generate presigned or public URL
         avatar_key = getattr(current_user, 'avatar_key', None)
         if avatar_key:
             if R2_PUBLIC_BASE:
@@ -282,7 +246,6 @@ def get_user_data(current_user):
                 except Exception as e:
                     logger.warning(f"Presigned generation failed: {e}")
                     avatar_url = None
-        # Fallback to legacy public avatar field if present
         if not avatar_url and getattr(current_user, 'avatar', None):
             avatar_url = current_user.avatar
     except Exception as e:
@@ -291,7 +254,6 @@ def get_user_data(current_user):
 
     user_dict = current_user.to_dict()
     user_dict['avatar'] = avatar_url
-    # indicate whether server is configured to send emails
     can_send = bool(SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_FROM)
     return jsonify({'success': True, 'user': user_dict, 'can_send_email': can_send})
 
@@ -308,7 +270,6 @@ def upload_avatar(current_user):
         if f.filename == '' or not allowed_file(f.filename):
             return jsonify({'error': 'Invalid file'}), 400
 
-        # Optional: validate image content
         f.stream.seek(0)
         file_bytes = f.read()
         if PIL_AVAILABLE:
@@ -318,17 +279,14 @@ def upload_avatar(current_user):
             except Exception:
                 return jsonify({'error': 'Invalid image file'}), 400
 
-        # Reset stream for upload
         file_stream = BytesIO(file_bytes)
         filename = secure_filename(f.filename)
         key = f"avatars/{current_user.id}/{uuid.uuid4()}_{filename}"
 
-        # Upload to R2
         try:
             s3_client.upload_fileobj(file_stream, R2_BUCKET_NAME, key)
         except Exception as e:
             logger.warning(f"upload_fileobj failed: {e}")
-            # try resetting stream and retry
             try:
                 file_stream.seek(0)
                 s3_client.upload_fileobj(file_stream, R2_BUCKET_NAME, key)
@@ -336,13 +294,10 @@ def upload_avatar(current_user):
                 logger.error(f"Second upload attempt failed: {e2}")
                 return jsonify({'error': 'Upload failed'}), 500
 
-        # Store the object key in DB (do NOT store presigned URL)
         current_user.avatar_key = key
-        # Optionally clear legacy public avatar field
         current_user.avatar = None
         db.session.commit()
 
-        # Return user with generated avatar URL
         avatar_url = None
         if R2_PUBLIC_BASE:
             avatar_url = f"{R2_PUBLIC_BASE.rstrip('/')}/{key}"
@@ -365,7 +320,7 @@ def upload_avatar(current_user):
         return jsonify({'error': 'Upload failed'}), 500
 
 # ---------------------------
-# Send avatar in email (inline) - uses SMTP if configured
+# Send avatar in email
 # ---------------------------
 def send_avatar_email(user):
     try:
@@ -382,16 +337,13 @@ def send_avatar_email(user):
                         ExpiresIn=3600
                     )
                 except Exception as e:
-                    logger.error(f"Failed to generate presigned for email: {e}")
                     avatar_url = None
-        # fallback to legacy avatar
         if not avatar_url and getattr(user, 'avatar', None):
             avatar_url = user.avatar
 
         if not avatar_url:
             return {'error': 'No avatar'}
 
-        # fetch image bytes
         r = requests.get(avatar_url, timeout=15)
         if r.status_code != 200:
             return {'error': 'Failed to fetch avatar'}
@@ -399,7 +351,6 @@ def send_avatar_email(user):
         img_data = r.content
         content_type = r.headers.get('Content-Type', 'image/png')
         maintype, subtype = content_type.split('/', 1) if '/' in content_type else ('image', 'png')
-
         cid = make_msgid(domain='sl-dubbing.local')
 
         msg = EmailMessage()
@@ -421,7 +372,6 @@ def send_avatar_email(user):
         msg.get_payload()[1].add_related(img_data, maintype=maintype, subtype=subtype, cid=cid)
 
         if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-            logger.error("SMTP credentials not configured")
             return {'error': 'smtp_not_configured'}
 
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
@@ -443,7 +393,7 @@ def send_avatar_email_endpoint(current_user):
     return jsonify({'error': res.get('error', 'failed')}), 500
 
 # ---------------------------
-# Upload dubbing (uses atomic deduction)
+# Upload dubbing 
 # ---------------------------
 @app.route('/api/dub', methods=['POST'])
 @token_required
@@ -454,7 +404,6 @@ def upload_dub(current_user):
             return jsonify({"error": "رصيد غير كافٍ"}), 402
 
         if 'media_file' not in request.files:
-            # refund
             session = db.session
             with session.begin():
                 user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
@@ -465,7 +414,6 @@ def upload_dub(current_user):
 
         file = request.files['media_file']
         if not file or not file.filename:
-            # refund
             session = db.session
             with session.begin():
                 user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
@@ -515,7 +463,6 @@ def upload_dub(current_user):
             'voice_id': voice_name,
             'sample_b64': sample_b64,
         }
-        # dispatch background task (handle both Celery and Modal style)
         try:
             if hasattr(process_dub, 'delay'):
                 process_dub.delay(payload)
@@ -525,7 +472,6 @@ def upload_dub(current_user):
                 process_dub(payload)
         except Exception as e:
             logger.error(f"Failed to dispatch process_dub: {e}")
-            # mark job failed and refund
             try:
                 job.status = 'failed'
                 db.session.commit()
@@ -546,7 +492,7 @@ def upload_dub(current_user):
         return jsonify({"error": "حدث خطأ أثناء الرفع للسحابة"}), 500
 
 # ---------------------------
-# Upload TTS (high quality) with atomic deduction
+# Upload TTS
 # ---------------------------
 @app.route('/api/tts', methods=['POST'])
 @token_required
@@ -609,7 +555,6 @@ def upload_tts(current_user):
                 db.session.commit()
             except Exception:
                 db.session.rollback()
-            # refund
             session = db.session
             with session.begin():
                 user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
@@ -647,7 +592,7 @@ def get_job(current_user, job_id):
     })
 
 # ---------------------------
-# Quick TTS via Modal fast stream (atomic deduction)
+# Quick TTS via Modal fast stream 
 # ---------------------------
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
@@ -684,7 +629,6 @@ def tts_quick(current_user):
         )
 
         if modal_response.status_code != 200:
-            # refund
             session = db.session
             with session.begin():
                 user = session.query(User).with_for_update().filter(User.id == current_user.id).one_or_none()
