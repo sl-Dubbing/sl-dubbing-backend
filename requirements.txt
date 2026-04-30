@@ -13,4 +13,4 @@ celery==5.3.6
 redis==5.0.1
 modal==0.62.15
 flower==2.0.1
-gevent==24.11.1
+gevent==23.9.1
