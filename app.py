@@ -1,13 +1,17 @@
-# app.py — V4.0 (Merged Gateway & Server - Async Fixed)
+# app.py — V4.1 (Merged Gateway & Server - Async Fixed & Dubbing Restored)
 import os
 import time
 import base64
 import asyncio
 import logging
+import uuid
 import datetime as _dt
 from functools import wraps
 
 import jwt
+import boto3
+from botocore.client import Config
+from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -58,6 +62,17 @@ db.init_app(app)
 SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET')
 MAX_TTS_LENGTH = int(os.environ.get('MAX_TTS_LENGTH', 5000))
 
+# إعداد Cloudflare R2 Client (تمت إعادته لدعم رفع الفيديوهات)
+R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
+s3_client = boto3.client(
+    's3',
+    endpoint_url=os.environ.get('R2_ENDPOINT_URL'),
+    aws_access_key_id=os.environ.get('R2_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
+    config=Config(signature_version='s3v4'),
+)
+R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')
+
 # ---------------------------
 # دوال المساعدة والمصادقة
 # ---------------------------
@@ -84,7 +99,6 @@ def token_required(f):
             return jsonify({'success': False, 'error': 'التوكن مفقود'}), 401
 
         try:
-            # التحقق المحلي (سريع جداً ولا يحتاج اتصال خارجي)
             data = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
             email = data.get('email')
             
@@ -132,9 +146,55 @@ def health_check():
 @app.route('/api/user', methods=['GET'])
 @token_required
 def get_user(current_user):
-    return jsonify({'success': True, 'user': current_user.to_dict()}), 200
+    user_dict = current_user.to_dict()
+    if getattr(current_user, 'avatar_key', None) and R2_PUBLIC_BASE:
+        user_dict['avatar'] = f"{R2_PUBLIC_BASE.rstrip('/')}/{current_user.avatar_key}"
+    return jsonify({'success': True, 'user': user_dict}), 200
 
-# مسار توليد الصوت السريع عبر Edge-TTS (مُصحح)
+# ---------------------------
+# 1. مسار الدبلجة (تمت إعادته)
+# ---------------------------
+@app.route('/api/dubbing', methods=['POST'])
+@token_required
+def start_dubbing_route(current_user):
+    cost = int(os.environ.get('DUB_COST', 100))
+    if not deduct_credits_atomic(current_user.id, cost):
+        return jsonify({"error": "رصيد غير كافٍ"}), 402
+
+    file = request.files.get('media_file')
+    if not file: 
+        # إرجاع الرصيد في حال عدم وجود ملف
+        deduct_credits_atomic(current_user.id, -cost)
+        return jsonify({"error": "لم يتم رفع ملف"}), 400
+
+    # رفع الفيديو إلى R2
+    file_key = f"uploads/{uuid.uuid4()}_{secure_filename(file.filename)}"
+    s3_client.upload_fileobj(file, R2_BUCKET_NAME, file_key)
+
+    new_job = DubbingJob(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        status='pending',
+        language=request.form.get('lang', 'ar'),
+        method='dubbing'
+    )
+    db.session.add(new_job)
+    db.session.commit()
+
+    # الإرسال لـ Worker
+    process_dub.delay({
+        'job_id': new_job.id,
+        'file_key': file_key,
+        'lang': new_job.language,
+        'voice_id': request.form.get('voice_id', 'source'),
+        'sample_b64': request.form.get('sample_b64', '')
+    })
+
+    return jsonify({"success": True, "job_id": new_job.id})
+
+# ---------------------------
+# 2. مسار التوليد السريع (Edge-TTS)
+# ---------------------------
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
 @json_required
@@ -148,13 +208,12 @@ def quick_tts(current_user):
     if not text:
         return jsonify({"error": "النص مفقود"}), 400
     if len(text) > MAX_TTS_LENGTH:
-        return jsonify({"error": f"النص طويل جداً"}), 400
+        return jsonify({"error": "النص طويل جداً"}), 400
 
-    cost = 1 # تكلفة رمزية للخدمة السريعة
+    cost = 1 
     if not deduct_credits_atomic(current_user.id, cost):
         return jsonify({"error": "رصيدك غير كافٍ"}), 402
 
-    # دالة غير متزامنة لجلب الصوت من Edge-TTS
     async def get_audio_chunks():
         communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
         chunks = []
@@ -165,13 +224,11 @@ def quick_tts(current_user):
 
     def generate():
         try:
-            # تشغيل الـ Async داخل بيئة Flask المتزامنة بشكل آمن
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             audio_data_list = loop.run_until_complete(get_audio_chunks())
             loop.close()
 
-            # إرسال البيانات كـ Stream
             for chunk in audio_data_list:
                 yield chunk
         except Exception as e:
@@ -182,7 +239,9 @@ def quick_tts(current_user):
     response.headers['Access-Control-Expose-Headers'] = 'X-Remaining-Credits'
     return response
 
-# مسار طلب التوليد الذكي للـ Worker
+# ---------------------------
+# 3. مسار التوليد الذكي (Modal)
+# ---------------------------
 @app.route('/api/tts/smart', methods=['POST'])
 @token_required
 @json_required
@@ -192,7 +251,7 @@ def start_smart_tts(current_user):
     if not text:
         return jsonify({"error": "النص غير موجود"}), 400
 
-    cost = 10 # تكلفة الجودة العالية
+    cost = 10 
     if not deduct_credits_atomic(current_user.id, cost):
         return jsonify({"error": "رصيدك غير كافٍ"}), 402
 
@@ -216,9 +275,7 @@ def start_smart_tts(current_user):
             'pitch': data.get('pitch', '+0Hz')
         }
 
-        # الإرسال لـ Celery Worker
         process_smart_tts.delay(payload)
-
         return jsonify({"success": True, "job_id": str(new_job.id)}), 202
 
     except Exception as e:
