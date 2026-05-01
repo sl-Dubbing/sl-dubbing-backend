@@ -51,15 +51,18 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
 # ==========================================
-# إعداد Supabase Client
+# إعداد Supabase Client (نسخة متوافقة مع التحديثات)
 # ==========================================
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
-supabase_client: Client = None
+supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
+    try:
+        # قمنا بإزالة التلميح النوعي : Client لحل مشكلة التعارض
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        logger.error(f"Failed to connect to Supabase: {e}")
 # ==========================================
 # إعداد Cloudflare R2
 # ==========================================
