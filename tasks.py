@@ -1,4 +1,4 @@
-# tasks.py — V3.3 (Audited & Production Ready)
+# tasks.py — V3.4 (Audited, Fixed Env Vars & Production Ready)
 import os
 import time
 import logging
@@ -162,9 +162,9 @@ def process_smart_tts(self, payload):
                 ContentType='audio/mpeg'
             )
 
-            # 3. بناء الرابط النهائي (هام: R2_PUBLIC_URL)
-            public_base = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
-            if not public_base: raise Exception("R2_PUBLIC_URL variable missing")
+            # 3. بناء الرابط النهائي (تم إصلاح اسم المتغير هنا)
+            public_base = os.environ.get('R2_PUBLIC_BASE', os.environ.get('R2_PUBLIC_URL', '')).rstrip('/')
+            if not public_base: raise Exception("R2_PUBLIC_BASE variable missing in Railway")
             
             job.output_url = f"{public_base}/{out_key}"
             job.status = 'completed'
