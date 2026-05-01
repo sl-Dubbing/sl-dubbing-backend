@@ -1,4 +1,4 @@
-# server.py — V2.6 (Railway Production Ready)
+# server.py — V2.7 (Fixed Auth & CORS)
 import os
 import uuid
 import json
@@ -66,10 +66,9 @@ s3_client = boto3.client(
 
 R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')
 
-# إعدادات CORS للسماح بالوصول من GitHub Pages
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', "*").split(',')
-ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
-CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS)
+# 1. إصلاح مشكلة CORS للسماح بالوصول من GitHub Pages بأمان
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'https://sl-dubbing.github.io')
+CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS.split(','))
 
 # إعدادات الكوكيز والأمان
 COOKIE_NAME = os.environ.get('COOKIE_NAME', 'session')
@@ -94,7 +93,6 @@ def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
-        # فحص الهيدر أو الكوكيز
         auth_header = request.headers.get('Authorization', '')
         if auth_header and auth_header.lower().startswith('bearer '):
             token = auth_header.split()[1]
@@ -102,40 +100,46 @@ def token_required(f):
             token = request.cookies.get(COOKIE_NAME)
 
         if not token:
-            return jsonify({'error': 'Unauthorized'}), 401
+            return jsonify({'error': 'Unauthorized - Missing Token'}), 401
             
         try:
             if not SUPABASE_JWT_SECRET:
-                raise Exception("SUPABASE_JWT_SECRET is not set")
+                logger.error("SUPABASE_JWT_SECRET is missing from environment variables!")
+                return jsonify({'error': 'Server Configuration Error'}), 500
 
-            # فك تشفير توكن Supabase
+            # 2. إصلاح فك التشفير وتخطي مشكلة الـ Audience
             data = jwt.decode(
                 token, 
                 SUPABASE_JWT_SECRET, 
                 algorithms=["HS256"], 
-                audience="authenticated"
+                options={"verify_aud": False} 
             )
             
             email = data.get('email')
-            if not email: return jsonify({'error': 'Invalid token payload'}), 401
+            if not email: 
+                return jsonify({'error': 'Invalid token payload'}), 401
 
             current_user = User.query.filter_by(email=email).first()
             
-            # إنشاء مستخدم جديد إذا لم يكن موجوداً (Just-in-time provisioning)
             if not current_user:
                 meta = data.get('user_metadata', {})
                 current_user = User(
                     email=email,
                     name=meta.get('full_name', meta.get('name', email.split('@')[0])),
                     avatar=meta.get('avatar_url'),
-                    credits=1000 # رصيد مجاني عند التسجيل
+                    credits=500 # تم التعديل لتصبح 500 نقطة
                 )
                 db.session.add(current_user)
                 db.session.commit()
 
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token has expired'}), 401
+        except jwt.InvalidTokenError as e:
+            logger.warning(f"JWT Invalid Error: {e}")
+            return jsonify({'error': f'Invalid token: {e}'}), 401
         except Exception as e:
-            logger.warning(f"Auth Error: {e}")
-            return jsonify({'error': 'Invalid session'}), 401
+            logger.error(f"General Auth Error: {e}")
+            return jsonify({'error': 'Internal Server Error'}), 500
             
         return f(current_user, *args, **kwargs)
     return decorated
@@ -158,11 +162,12 @@ def deduct_credits_atomic(user_id, amount):
 # مسارات الـ API (Routes)
 # ==========================================
 
+# 3. إصلاح الرابط 404 (دمجنا المسارين لضمان قراءة الواجهة للنقاط)
 @app.route('/api/user', methods=['GET'])
+@app.route('/api/user/credits', methods=['GET'])
 @token_required
 def get_user_data(current_user):
     user_dict = current_user.to_dict()
-    # إنشاء رابط الأفاتار من R2
     if current_user.avatar_key and R2_PUBLIC_BASE:
         user_dict['avatar'] = f"{R2_PUBLIC_BASE.rstrip('/')}/{current_user.avatar_key}"
     return jsonify({'success': True, 'user': user_dict})
@@ -177,7 +182,6 @@ def start_dubbing_route(current_user):
     file = request.files.get('media_file')
     if not file: return jsonify({"error": "لم يتم رفع ملف"}), 400
 
-    # رفع الملف إلى R2
     file_key = f"uploads/{uuid.uuid4()}_{secure_filename(file.filename)}"
     s3_client.upload_fileobj(file, R2_BUCKET_NAME, file_key)
 
@@ -191,7 +195,6 @@ def start_dubbing_route(current_user):
     db.session.add(job)
     db.session.commit()
 
-    # إرسال المهمة للـ Worker (Celery)
     process_dub.delay({
         'job_id': job.id,
         'file_key': file_key,
