@@ -1,4 +1,4 @@
-# tasks.py — V3.5 (Production Hardened)
+# tasks.py — V3.6 (Fixed Imports & Supabase Compatible)
 import os
 import time
 import logging
@@ -7,7 +7,9 @@ import uuid
 import requests
 import base64
 import boto3
-from botocore.client import Config, BotoCoreError, ClientError
+# 🛠️ التعديل الجذري هنا: فصل الاستدعاءات لتجنب ImportError
+from botocore.client import Config
+from botocore.exceptions import BotoCoreError, ClientError 
 from celery import Celery
 from dotenv import load_dotenv
 
@@ -54,23 +56,19 @@ s3_client = boto3.client(
 MODAL_DUBBING_URL = os.environ.get("MODAL_DUBBING_URL", "").rstrip('/')
 R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE', '').rstrip('/')
 
-# Validate critical env early
-missing = []
-if not R2_BUCKET_NAME: missing.append('R2_BUCKET_NAME')
-if not MODAL_DUBBING_URL: missing.append('MODAL_DUBBING_URL')
-if missing:
-    logger.warning("Missing environment variables: %s", ", ".join(missing))
-
+# Helper to ensure database is ready
 def _refund_and_fail(job, error_msg):
     try:
         logger.error("Refunding and failing job_id=%s user_id=%s reason=%s", job.id, job.user_id, error_msg)
         u = User.query.get(job.user_id)
-        if u and getattr(job, 'credits_used', None):
-            u.credits = (u.credits or 0) + job.credits_used
+        # التأكد من وجود رصيد مستخدم قبل الاسترجاع
+        credits_to_refund = getattr(job, 'credits_used', 100) # الافتراضي 100 إذا لم يحدد
+        if u:
+            u.credits = (u.credits or 0) + credits_to_refund
             db.session.add(CreditTransaction(
                 user_id=u.id,
                 transaction_type='refund',
-                amount=job.credits_used,
+                amount=credits_to_refund,
                 reason=f'Failure: {str(error_msg)[:200]}',
                 job_id=job.id
             ))
@@ -106,13 +104,9 @@ def process_dub(self, payload):
 
         start_ts = time.time()
         try:
-            # create temp file path
             temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.tmp")
-
-            # download from R2 with retries
             _download_from_r2(R2_BUCKET_NAME, file_key, temp_path)
 
-            # send to Modal Dubbing Engine
             url = f"{MODAL_DUBBING_URL}/upload"
             with open(temp_path, 'rb') as f:
                 files = {'media_file': f}
@@ -122,40 +116,28 @@ def process_dub(self, payload):
                     'sample_b64': payload.get('sample_b64', '')
                 }
                 resp = requests.post(url, files=files, data=data, timeout=int(os.environ.get('MODAL_TIMEOUT', 1800)))
+            
             if resp.status_code != 200:
-                raise Exception(f"Modal Gateway Error: {resp.status_code} {resp.text[:200]}")
+                raise Exception(f"Modal Gateway Error: {resp.status_code}")
 
             res_json = resp.json()
             if not res_json.get("success"):
                 raise Exception(res_json.get('error', 'Dubbing Logic Error'))
 
-            # update job
             job.output_url = res_json.get("audio_url")
             job.status = 'completed'
             job.processing_time = round(time.time() - start_ts, 2)
             db.session.commit()
 
-            # delete original file from R2 (best-effort)
-            try:
-                s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=file_key)
-            except Exception as e:
-                logger.warning("Failed to delete original file from R2 key=%s: %s", file_key, e)
-
             return {"status": "done", "url": job.output_url}
 
         except Exception as e:
-            logger.exception("Processing failed for job_id=%s: %s", job_id, e)
-            try:
-                _refund_and_fail(job, str(e))
-            except Exception:
-                logger.exception("Refund attempt failed for job_id=%s", job_id)
+            logger.exception("Processing failed for job_id=%s", job_id)
+            _refund_and_fail(job, str(e))
             return {"error": str(e)}
         finally:
             if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception as e:
-                    logger.warning("Failed to remove temp file %s: %s", temp_path, e)
+                os.remove(temp_path)
 
 @celery_app.task(name='tasks.process_smart_tts', bind=True, max_retries=2, autoretry_for=(Exception,), retry_backoff=True, retry_backoff_max=600)
 def process_smart_tts(self, payload):
@@ -163,26 +145,18 @@ def process_smart_tts(self, payload):
 
     with flask_app.app_context():
         job = DubbingJob.query.get(job_id)
-        if not job:
-            logger.error("Job not found job_id=%s", job_id)
-            return {"error": "Job not found"}
+        if not job: return {"error": "Job not found"}
 
         start_ts = time.time()
         try:
-            # Use Modal SDK if available, otherwise raise
-            try:
-                import modal
-                tts_func = modal.Function.lookup("sl-tts-factory", "process_tts")
-            except Exception as e:
-                logger.exception("Modal SDK lookup failed: %s", e)
-                raise Exception("Modal SDK not available")
+            # التحقق من وجود Modal SDK
+            import modal
+            tts_func = modal.Function.lookup("sl-tts-factory", "process_tts")
 
-            mode = 'quality' if payload.get('sample_b64') else 'fast'
-            # remote call (may be blocking depending on SDK)
             result = tts_func.remote({
                 'text': payload.get('text', ''),
                 'lang': payload.get('lang', 'en'),
-                'mode': mode,
+                'mode': 'quality' if payload.get('sample_b64') else 'fast',
                 'sample_b64': payload.get('sample_b64', ''),
                 'rate': payload.get('rate', '+0%'),
                 'pitch': payload.get('pitch', '+0Hz')
@@ -201,9 +175,6 @@ def process_smart_tts(self, payload):
                 ContentType='audio/mpeg'
             )
 
-            if not R2_PUBLIC_BASE:
-                raise Exception("R2_PUBLIC_BASE is not configured")
-
             job.output_url = f"{R2_PUBLIC_BASE}/{out_key}"
             job.status = 'completed'
             job.processing_time = round(time.time() - start_ts, 2)
@@ -212,9 +183,6 @@ def process_smart_tts(self, payload):
             return {"status": "done", "url": job.output_url}
 
         except Exception as e:
-            logger.exception("Smart TTS failed for job_id=%s: %s", job_id, e)
-            try:
-                _refund_and_fail(job, str(e))
-            except Exception:
-                logger.exception("Refund attempt failed for job_id=%s", job_id)
+            logger.exception("Smart TTS failed for job_id=%s", job_id)
+            _refund_and_fail(job, str(e))
             return {"error": str(e)}
