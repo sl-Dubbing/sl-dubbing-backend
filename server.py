@@ -2,6 +2,7 @@ import os
 import uuid
 import logging
 from functools import wraps
+import jwt # استيراد مكتبة فك التشفير
 
 import boto3
 from botocore.client import Config
@@ -9,9 +10,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
-
-# الاستيراد الصحيح للمكتبة الرسمية
-from supabase import create_client
 
 from models import db, User, DubbingJob, CreditTransaction
 from tasks import process_dub
@@ -34,19 +32,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
-# ==========================================
-# إعداد Supabase Client
-# ==========================================
-SUPABASE_URL = os.environ.get('SUPABASE_URL')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
-
-supabase_client = None
-if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        # إنشاء العميل بدون تلميحات نوعية معقدة
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception as e:
-        logger.error(f"Supabase Connection Error: {e}")
+SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET') # نحتاج لسر الـ JWT
 
 # ==========================================
 # إعداد Cloudflare R2
@@ -86,18 +72,21 @@ def token_required(f):
             return jsonify({'error': 'Unauthorized'}), 401
             
         try:
-            # التحقق من المستخدم عبر Supabase Auth
-            # ملاحظة: في الإصدارات الحديثة نستخدم get_user() مباشرة من auth
-            user_data = supabase_client.auth.get_user(token)
+            # فك تشفير التوكن يدوياً دون الحاجة لمكتبة Supabase
+            if not SUPABASE_JWT_SECRET:
+                 logger.error("SUPABASE_JWT_SECRET is not set!")
+                 return jsonify({'error': 'Server config error'}), 500
+
+            decoded = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
+            email = decoded.get('email')
             
-            if not user_data or not user_data.user:
+            if not email:
                 return jsonify({'error': 'Invalid Session'}), 401
                 
-            email = user_data.user.email
             current_user = User.query.filter_by(email=email).first()
             
             if not current_user:
-                meta = user_data.user.user_metadata or {}
+                meta = decoded.get('user_metadata', {})
                 current_user = User(
                     email=email,
                     name=meta.get('full_name', email.split('@')[0]),
@@ -107,6 +96,8 @@ def token_required(f):
                 db.session.add(current_user)
                 db.session.commit()
 
+        except jwt.ExpiredSignatureError:
+             return jsonify({'error': 'Token expired'}), 401
         except Exception as e:
             logger.error(f"Auth Logic Failure: {e}")
             return jsonify({'error': 'Session expired or invalid'}), 401
@@ -140,7 +131,6 @@ def start_dubbing_route(current_user):
     file_key = f"uploads/{uuid.uuid4()}_{secure_filename(file.filename)}"
     s3_client.upload_fileobj(file, R2_BUCKET_NAME, file_key)
 
-    # خصم الرصيد
     current_user.credits -= cost
     job = DubbingJob(
         id=str(uuid.uuid4()),
