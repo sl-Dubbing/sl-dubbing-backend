@@ -2,7 +2,7 @@ import os
 import uuid
 import logging
 from functools import wraps
-import jwt # استيراد مكتبة فك التشفير
+import requests # 🚀 سنعتمد على هذه المكتبة المستقرة جداً للتحقق من التوكن
 
 import boto3
 from botocore.client import Config
@@ -32,7 +32,9 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
-SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET') # نحتاج لسر الـ JWT
+# مفاتيح Supabase
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
 # ==========================================
 # إعداد Cloudflare R2
@@ -72,21 +74,33 @@ def token_required(f):
             return jsonify({'error': 'Unauthorized'}), 401
             
         try:
-            # فك تشفير التوكن يدوياً دون الحاجة لمكتبة Supabase
-            if not SUPABASE_JWT_SECRET:
-                 logger.error("SUPABASE_JWT_SECRET is not set!")
-                 return jsonify({'error': 'Server config error'}), 500
+            # 🚀 استدعاء مباشر لـ Supabase للتحقق من التوكن (REST API)
+            if not SUPABASE_URL or not SUPABASE_KEY:
+                logger.error("SUPABASE_URL or SUPABASE_KEY is missing!")
+                return jsonify({'error': 'Server config error'}), 500
 
-            decoded = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
-            email = decoded.get('email')
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'apikey': SUPABASE_KEY
+            }
+            
+            # نرسل التوكن لـ Supabase لتأكيده وإرجاع بيانات المستخدم
+            auth_response = requests.get(f"{SUPABASE_URL}/auth/v1/user", headers=headers)
+            
+            if auth_response.status_code != 200:
+                logger.warning(f"Supabase Auth rejected token. Status: {auth_response.status_code}")
+                return jsonify({'error': 'Invalid or expired Session'}), 401
+                
+            user_data = auth_response.json()
+            email = user_data.get('email')
             
             if not email:
-                return jsonify({'error': 'Invalid Session'}), 401
+                return jsonify({'error': 'Invalid user data'}), 401
                 
             current_user = User.query.filter_by(email=email).first()
             
             if not current_user:
-                meta = decoded.get('user_metadata', {})
+                meta = user_data.get('user_metadata', {})
                 current_user = User(
                     email=email,
                     name=meta.get('full_name', email.split('@')[0]),
@@ -96,11 +110,9 @@ def token_required(f):
                 db.session.add(current_user)
                 db.session.commit()
 
-        except jwt.ExpiredSignatureError:
-             return jsonify({'error': 'Token expired'}), 401
         except Exception as e:
             logger.error(f"Auth Logic Failure: {e}")
-            return jsonify({'error': 'Session expired or invalid'}), 401
+            return jsonify({'error': 'Server error during auth'}), 500
             
         return f(current_user, *args, **kwargs)
     return decorated
