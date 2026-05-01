@@ -1,16 +1,21 @@
-# server.py — V2.10 (Secure REST Supabase Auth, Atomic Credits, R2 Safety)
+# server.py — V2.11 (Secure REST Supabase Auth, Atomic Credits, R2 Safety)
 import os
 import uuid
 import logging
 from functools import wraps
+from datetime import timedelta
+
 import requests
 from werkzeug.utils import secure_filename
 
 import boto3
 from botocore.client import Config
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
+
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from models import db, User, DubbingJob, CreditTransaction
 from tasks import process_dub
@@ -38,24 +43,45 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 
 # R2 / S3 client
-s3_client = boto3.client(
-    's3',
-    endpoint_url=os.environ.get('R2_ENDPOINT_URL'),
-    aws_access_key_id=os.environ.get('R2_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
-    config=Config(signature_version='s3v4'),
-)
+R2_ENDPOINT_URL = os.environ.get('R2_ENDPOINT_URL')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')
 
+# Validate R2 config at startup (fail fast)
+if not all([R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
+    logger.warning("R2 configuration incomplete. File uploads will fail until R2 env vars are set.")
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=R2_ENDPOINT_URL,
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=Config(signature_version='s3v4'),
+)
+
 # CORS
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'https://sl-dubbing.github.io')
-CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS.split(','))
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('ALLOWED_ORIGINS', 'https://sl-dubbing.github.io').split(',') if o.strip()]
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ['https://sl-dubbing.github.io']
+
+CORS(
+    app,
+    supports_credentials=True,
+    origins=ALLOWED_ORIGINS,
+    allow_headers=['Content-Type', 'Authorization', 'apikey', 'X-Requested-With'],
+    expose_headers=['Content-Type', 'Content-Length'],
+    methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    max_age=timedelta(hours=1)
+)
+
 COOKIE_NAME = os.environ.get('COOKIE_NAME', 'session')
 
 # File restrictions
 ALLOWED_EXTENSIONS = {'mp4', 'mp3', 'wav'}
-MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', 200))  # example default 200MB
+MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', 200))
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -82,14 +108,12 @@ def token_required(f):
                 'Authorization': f'Bearer {token}',
                 'apikey': SUPABASE_KEY
             }
-            # timeout to avoid hanging requests
             resp = requests.get(f"{SUPABASE_URL.rstrip('/')}/auth/v1/user", headers=headers, timeout=5)
             if resp.status_code != 200:
                 logger.warning("Supabase auth rejected token status=%s", resp.status_code)
                 return jsonify({'error': 'Invalid or expired session'}), 401
 
             user_data = resp.json() or {}
-            # Supabase may return user object directly or nested; handle common shapes
             email = user_data.get('email') or (user_data.get('user') or {}).get('email')
             meta = user_data.get('user_metadata') or (user_data.get('user') or {}).get('user_metadata') or {}
 
@@ -97,6 +121,7 @@ def token_required(f):
                 logger.warning("Supabase returned no email in user payload")
                 return jsonify({'error': 'Invalid user data'}), 401
 
+            # Ensure user exists in our DB
             current_user = User.query.filter_by(email=email).first()
             if not current_user:
                 current_user = User(
@@ -117,20 +142,53 @@ def token_required(f):
         return f(current_user, *args, **kwargs)
     return decorated
 
-def deduct_credits_atomic(user_id, amount, job_id=None):
+def deduct_credits_atomic(session, user_id, amount, job_id=None):
+    """
+    Deduct credits using the provided session and a SELECT ... FOR UPDATE lock.
+    Returns True on success, False if insufficient credits or error.
+    """
     try:
-        user = User.query.with_for_update().get(user_id)
-        if not user or (user.credits or 0) < amount:
+        stmt = select(User).where(User.id == user_id).with_for_update()
+        user = session.execute(stmt).scalar_one_or_none()
+        if not user:
+            logger.warning("User not found for credit deduction user_id=%s", user_id)
+            return False
+        if (user.credits or 0) < amount:
+            logger.info("Insufficient credits for user_id=%s need=%s have=%s", user_id, amount, user.credits)
             return False
         user.credits -= amount
         tx = CreditTransaction(user_id=user_id, amount=amount, transaction_type='debit', job_id=job_id)
-        db.session.add(tx)
-        db.session.commit()
+        session.add(tx)
         return True
-    except Exception as e:
-        db.session.rollback()
-        logger.exception("Credit deduction failed for user_id=%s job_id=%s: %s", user_id, job_id, e)
+    except SQLAlchemyError as e:
+        logger.exception("SQLAlchemy error during credit deduction for user_id=%s job_id=%s: %s", user_id, job_id, e)
         return False
+    except Exception as e:
+        logger.exception("Unexpected error during credit deduction for user_id=%s job_id=%s: %s", user_id, job_id, e)
+        return False
+
+def get_file_size(file_storage):
+    """
+    Attempt to determine file size reliably from the stream.
+    Returns size in bytes or None if unknown.
+    """
+    try:
+        stream = file_storage.stream
+        current = stream.tell()
+        stream.seek(0, 2)
+        size = stream.tell()
+        stream.seek(current)
+        return size
+    except Exception:
+        return None
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get('Origin')
+    if origin and origin in ALLOWED_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    return response
 
 @app.route('/api/user', methods=['GET'])
 @app.route('/api/user/credits', methods=['GET'])
@@ -142,63 +200,120 @@ def get_user_data(current_user):
         user_dict['avatar'] = f"{R2_PUBLIC_BASE.rstrip('/')}/{avatar_key}"
     return jsonify({'success': True, 'user': user_dict})
 
-@app.route('/api/dubbing', methods=['POST'])
+@app.route('/api/dubbing', methods=['POST', 'OPTIONS'])
 @token_required
 def start_dubbing_route(current_user):
+    # Handle preflight quickly
+    if request.method == 'OPTIONS':
+        resp = make_response()
+        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '')
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, apikey, X-Requested-With'
+        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        return resp
+
     cost = int(os.environ.get('DUB_COST', 100))
 
     # File presence and basic validation
     file = request.files.get('media_file')
     if not file:
         return jsonify({"error": "No file uploaded"}), 400
+
     filename = secure_filename(file.filename or "")
-    if not allowed_file(filename):
+    if not filename or not allowed_file(filename):
         return jsonify({"error": "Unsupported file type"}), 400
 
-    # Check size if provided (werkzeug FileStorage may have content_length)
+    # Check size: prefer content_length but fall back to stream size
     content_length = request.content_length or 0
-    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-    if content_length and content_length > max_bytes:
+    if content_length and content_length > MAX_FILE_SIZE_BYTES:
         return jsonify({"error": "File too large"}), 413
 
-    # Create job early so we can link transactions
-    job = DubbingJob(
-        id=str(uuid.uuid4()),
-        user_id=current_user.id,
-        status='processing',
-        language=request.form.get('lang', 'ar'),
-        credits_used=cost
-    )
-    db.session.add(job)
-    db.session.flush()  # get job.id without commit
+    size = get_file_size(file)
+    if size and size > MAX_FILE_SIZE_BYTES:
+        return jsonify({"error": "File too large"}), 413
 
-    # Deduct credits atomically and link to job
-    if not deduct_credits_atomic(current_user.id, cost, job_id=job.id):
-        db.session.rollback()
-        return jsonify({"error": "Insufficient credits"}), 402
-
-    # Upload file to R2 with error handling
+    # Prepare file key
     file_key = f"uploads/{uuid.uuid4()}_{filename}"
+
+    # Create job and deduct credits in a single DB transaction
     try:
-        # ensure file pointer at start
+        with db.session.begin():
+            job = DubbingJob(
+                id=str(uuid.uuid4()),
+                user_id=current_user.id,
+                status='processing',
+                language=request.form.get('lang', 'ar'),
+                credits_used=cost
+            )
+            db.session.add(job)
+            db.session.flush()  # ensure job.id is available
+
+            # Deduct credits using the same session
+            ok = deduct_credits_atomic(db.session, current_user.id, cost, job_id=job.id)
+            if not ok:
+                # raising will rollback the transaction
+                raise ValueError("Insufficient credits")
+            # Do not set file_key yet; upload happens outside transaction
+    except ValueError:
+        return jsonify({"error": "Insufficient credits"}), 402
+    except Exception as e:
+        logger.exception("Failed to create job and deduct credits: %s", e)
+        return jsonify({"error": "Server error creating job"}), 500
+
+    # Upload file to R2 outside DB transaction to avoid long locks
+    try:
         file.stream.seek(0)
         s3_client.upload_fileobj(file.stream, R2_BUCKET_NAME, file_key)
     except Exception as e:
-        db.session.rollback()
         logger.exception("File upload failed for user_id=%s job_id=%s: %s", current_user.id, job.id, e)
+        # Mark job failed and refund in a new transaction
+        try:
+            with db.session.begin():
+                job_db = db.session.get(DubbingJob, job.id)
+                if job_db:
+                    job_db.status = 'failed'
+                    job_db.file_key = None
+                    db.session.add(job_db)
+                # refund
+                refund = CreditTransaction(user_id=current_user.id, amount=cost, transaction_type='credit', job_id=job.id)
+                db.session.add(refund)
+                user_db = db.session.get(User, current_user.id)
+                if user_db:
+                    user_db.credits = (user_db.credits or 0) + cost
+                    db.session.add(user_db)
+        except Exception:
+            logger.exception("Failed to refund after upload failure for job_id=%s", job.id)
         return jsonify({"error": "File upload failed"}), 500
 
-    # finalize job record
+    # finalize job record with file_key
     try:
-        job.file_key = file_key
-        db.session.add(job)
-        db.session.commit()
+        with db.session.begin():
+            job_db = db.session.get(DubbingJob, job.id)
+            if not job_db:
+                logger.error("Job disappeared before finalizing job_id=%s", job.id)
+                return jsonify({"error": "Server error creating job"}), 500
+            job_db.file_key = file_key
+            db.session.add(job_db)
     except Exception as e:
-        db.session.rollback()
         logger.exception("Failed to finalize job record job_id=%s: %s", job.id, e)
+        # Attempt to mark job failed and refund
+        try:
+            with db.session.begin():
+                job_db = db.session.get(DubbingJob, job.id)
+                if job_db:
+                    job_db.status = 'failed'
+                    db.session.add(job_db)
+                refund = CreditTransaction(user_id=current_user.id, amount=cost, transaction_type='credit', job_id=job.id)
+                db.session.add(refund)
+                user_db = db.session.get(User, current_user.id)
+                if user_db:
+                    user_db.credits = (user_db.credits or 0) + cost
+                    db.session.add(user_db)
+        except Exception:
+            logger.exception("Failed to refund after finalize failure for job_id=%s", job.id)
         return jsonify({"error": "Server error creating job"}), 500
 
-    # enqueue processing
+    # enqueue processing (best-effort)
     try:
         process_dub.delay({
             'job_id': job.id,
@@ -206,8 +321,8 @@ def start_dubbing_route(current_user):
             'lang': job.language,
             'voice_id': request.form.get('voice_id', 'source')
         })
-    except Exception as e:
-        logger.exception("Failed to enqueue job_id=%s: %s", job.id, e)
+    except Exception:
+        logger.exception("Failed to enqueue job_id=%s", job.id)
 
     return jsonify({"success": True, "job_id": job.id})
 
@@ -234,7 +349,8 @@ def health():
         'status': 'online',
         'server': os.environ.get('PLATFORM', 'unknown'),
         'db': 'ok' if db_ok else 'error',
-        'supabase_configured': bool(SUPABASE_URL and SUPABASE_KEY)
+        'supabase_configured': bool(SUPABASE_URL and SUPABASE_KEY),
+        'r2_configured': bool(R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME)
     })
 
 if __name__ == '__main__':
