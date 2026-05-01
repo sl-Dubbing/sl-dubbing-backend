@@ -159,13 +159,21 @@ def get_user_data(current_user):
 @app.route('/api/dubbing', methods=['POST'])
 @token_required
 def start_dubbing_route(current_user):
+    # 1. التأكد من الرصيد أولاً
     cost = int(os.environ.get('DUB_COST', 100))
     if (current_user.credits or 0) < cost:
         return jsonify({"error": "Insufficient credits"}), 402
 
-    file = request.files.get('media_file')
-    if not file: return jsonify({"error": "No file uploaded"}), 400
+    # 2. جعل السيرفر يقبل أي ملف مرفوع بغض النظر عن اسمه
+    file = None
+    if request.files:
+        # يأخذ أول ملف موجود في الطلب مهما كان اسمه
+        file = list(request.files.values())[0]
+    
+    if not file or file.filename == '':
+        return jsonify({"error": "No file uploaded"}), 400
 
+    # 3. تكملة الكود كما هو...
     file_key = f"uploads/{uuid.uuid4()}_{secure_filename(file.filename)}"
     s3_client.upload_fileobj(file, R2_BUCKET_NAME, file_key)
 
@@ -185,6 +193,8 @@ def start_dubbing_route(current_user):
         'file_key': file_key,
         'lang': job.language
     })
+
+    return jsonify({"success": True, "job_id": job.id})
 
     return jsonify({"success": True, "job_id": job.id})
 
