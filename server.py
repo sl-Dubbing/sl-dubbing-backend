@@ -1,15 +1,13 @@
-# server.py — V2.7 (Fixed Auth & CORS)
+# server.py — V2.8 (Ultimate Auth Fix with Official Supabase Client)
 import os
 import uuid
 import json
 import logging
 import time
-import base64
 import datetime as _dt
 from functools import wraps
 from io import BytesIO
 
-import jwt
 import requests
 import boto3
 from botocore.client import Config
@@ -19,9 +17,8 @@ from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 from sqlalchemy.orm import Session
 
-import smtplib
-from email.message import EmailMessage
-from email.utils import make_msgid
+# استدعاء مكتبة Supabase الرسمية
+from supabase import create_client, Client
 
 from models import db, User, DubbingJob, CreditTransaction
 from tasks import process_dub, process_smart_tts
@@ -42,10 +39,9 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # الإعدادات الأساسية (Environment Variables)
 # ==========================================
-SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET')
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
 
-# تصحيح رابط قاعدة البيانات ليتوافق مع SQLAlchemy
+# إعدادات قاعدة البيانات
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
@@ -54,7 +50,19 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
-# إعداد Cloudflare R2 / S3 Client
+# ==========================================
+# إعداد Supabase Client
+# ==========================================
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+
+supabase_client: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ==========================================
+# إعداد Cloudflare R2
+# ==========================================
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 s3_client = boto3.client(
     's3',
@@ -63,16 +71,15 @@ s3_client = boto3.client(
     aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
     config=Config(signature_version='s3v4'),
 )
-
 R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')
 
-# 1. إصلاح مشكلة CORS للسماح بالوصول من GitHub Pages بأمان
+# ==========================================
+# إعداد CORS
+# ==========================================
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'https://sl-dubbing.github.io')
 CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS.split(','))
 
-# إعدادات الكوكيز والأمان
 COOKIE_NAME = os.environ.get('COOKIE_NAME', 'session')
-MAX_TTS_LENGTH = int(os.environ.get('MAX_TTS_LENGTH', 5000))
 
 # ==========================================
 # دوال المساعدة (Helpers)
@@ -103,43 +110,37 @@ def token_required(f):
             return jsonify({'error': 'Unauthorized - Missing Token'}), 401
             
         try:
-            if not SUPABASE_JWT_SECRET:
-                logger.error("SUPABASE_JWT_SECRET is missing from environment variables!")
+            if not supabase_client:
+                logger.error("SUPABASE_URL or SUPABASE_KEY missing from environment variables!")
                 return jsonify({'error': 'Server Configuration Error'}), 500
 
-            # 2. إصلاح فك التشفير وتخطي مشكلة الـ Audience
-            data = jwt.decode(
-                token, 
-                SUPABASE_JWT_SECRET, 
-                algorithms=["HS256"], 
-                options={"verify_aud": False} 
-            )
+            # الحل الجذري: استخدام Supabase API للتحقق من التوكن (يتوافق مع جميع الخوارزميات الجديدة)
+            user_res = supabase_client.auth.get_user(token)
             
-            email = data.get('email')
-            if not email: 
+            if not user_res or not user_res.user:
+                return jsonify({'error': 'Invalid session'}), 401
+                
+            email = user_res.user.email
+            if not email:
                 return jsonify({'error': 'Invalid token payload'}), 401
 
             current_user = User.query.filter_by(email=email).first()
             
+            # إنشاء حساب محلي للمستخدم الجديد
             if not current_user:
-                meta = data.get('user_metadata', {})
+                meta = user_res.user.user_metadata or {}
                 current_user = User(
                     email=email,
                     name=meta.get('full_name', meta.get('name', email.split('@')[0])),
                     avatar=meta.get('avatar_url'),
-                    credits=500 # تم التعديل لتصبح 500 نقطة
+                    credits=500
                 )
                 db.session.add(current_user)
                 db.session.commit()
 
-        except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token has expired'}), 401
-        except jwt.InvalidTokenError as e:
-            logger.warning(f"JWT Invalid Error: {e}")
-            return jsonify({'error': f'Invalid token: {e}'}), 401
         except Exception as e:
-            logger.error(f"General Auth Error: {e}")
-            return jsonify({'error': 'Internal Server Error'}), 500
+            logger.warning(f"Supabase Auth Error: {e}")
+            return jsonify({'error': 'Invalid or expired token'}), 401
             
         return f(current_user, *args, **kwargs)
     return decorated
@@ -162,7 +163,6 @@ def deduct_credits_atomic(user_id, amount):
 # مسارات الـ API (Routes)
 # ==========================================
 
-# 3. إصلاح الرابط 404 (دمجنا المسارين لضمان قراءة الواجهة للنقاط)
 @app.route('/api/user', methods=['GET'])
 @app.route('/api/user/credits', methods=['GET'])
 @token_required
