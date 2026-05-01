@@ -126,8 +126,10 @@ def token_required(f):
 @token_required
 def get_user_data(current_user):
     user_dict = current_user.to_dict()
-    if current_user.avatar_key and R2_PUBLIC_BASE:
-        user_dict['avatar'] = f"{R2_PUBLIC_BASE.rstrip('/')}/{current_user.avatar_key}"
+    # 🛠️ الحل هنا: نستخدم getattr لكي لا ينهار السيرفر إذا لم يجد avatar_key
+    avatar_key = getattr(current_user, 'avatar_key', None)
+    if avatar_key and R2_PUBLIC_BASE:
+        user_dict['avatar'] = f"{R2_PUBLIC_BASE.rstrip('/')}/{avatar_key}"
     return jsonify({'success': True, 'user': user_dict})
 
 @app.route('/api/dubbing', methods=['POST'])
