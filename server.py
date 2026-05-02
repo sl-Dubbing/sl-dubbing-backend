@@ -137,6 +137,20 @@ def get_user(user):
     })
 
 
+@app.route('/api/user/credits', methods=['GET'])
+@token_required
+def get_credits(user):
+    """endpoint مختصر لـ shared.js (يجلب الرصيد فقط)"""
+    return jsonify({
+        'success': True,
+        'user': {
+            'id': user.id,
+            'credits': user.credits
+        },
+        'credits': user.credits  # backward compat
+    })
+
+
 # ==========================================
 # 🚀 NEW: Direct Upload Endpoints
 # ==========================================
@@ -315,6 +329,7 @@ def list_jobs(user):
 # 🎙️ TTS endpoint (يبقى كما هو، لا يحتاج upload)
 # ==========================================
 @app.route('/api/tts', methods=['POST'])
+@app.route('/api/tts/smart', methods=['POST'])  # alias لتوافق frontend
 @token_required
 def start_tts(user):
     data = request.get_json() or {}
@@ -397,6 +412,77 @@ def tts_quick(user):
         mimetype='audio/mpeg',
         headers={'X-Remaining-Credits': str(user.credits)}
     )
+
+
+# ==========================================
+# 🎙️ STT — Speech to Text
+# ==========================================
+@app.route('/api/stt', methods=['POST'])
+@token_required
+def start_stt(user):
+    """
+    🎙️ تفريغ صوت/فيديو إلى نص (بعد رفعه مباشرة لـ R2)
+    
+    Request: {
+      "file_key": "uploads/u1/abc.mp4",
+      "language": "auto",       // أو ar, en, fr...
+      "mode": "fast",            // أو precise (للدقة + diarization)
+      "diarize": false,
+      "translate": false         // ترجمة للإنجليزية
+    }
+    """
+    data = request.get_json() or {}
+    file_key = data.get('file_key')
+    language = data.get('language', 'auto')
+    mode = data.get('mode', 'fast')  # fast or precise
+    diarize = bool(data.get('diarize', False))
+    translate = bool(data.get('translate', False))
+
+    if not file_key:
+        return jsonify({'error': 'file_key required'}), 400
+
+    try:
+        s3.head_object(Bucket=R2_BUCKET, Key=file_key)
+    except Exception:
+        return jsonify({'error': 'File not found in storage'}), 404
+
+    if user.credits < 1:
+        return jsonify({'error': 'Insufficient credits'}), 402
+
+    media_url = s3.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': R2_BUCKET, 'Key': file_key},
+        ExpiresIn=7200
+    )
+
+    job = DubbingJob(
+        user_id=user.id,
+        kind='stt',
+        lang=language,
+        engine=mode,
+        status='queued',
+        input_key=file_key,
+        created_at=datetime.utcnow()
+    )
+    db.session.add(job)
+    db.session.commit()
+
+    from tasks import process_stt
+    process_stt.delay(
+        job_id=job.id,
+        media_url=media_url,
+        language=language if language != 'auto' else None,
+        mode=mode,
+        diarize=diarize,
+        translate=translate,
+    )
+
+    return jsonify({
+        'success': True,
+        'job_id': job.id,
+        'status': 'queued',
+        'mode': mode,
+    })
 
 
 # ==========================================
