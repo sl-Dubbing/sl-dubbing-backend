@@ -163,10 +163,21 @@ def token_required(f):
 
 def deduct_credits_atomic(user_id, amount, job_id=None):
     try:
-        user = db.session.query(User).with_for_update().get(user_id)
-        if not user or (user.credits or 0) < amount:
+        # 1. استخدمنا filter_by بدلاً من get لتتوافق مع الإصدارات الحديثة من قواعد البيانات
+        user = db.session.query(User).filter_by(id=user_id).with_for_update().first()
+        
+        if not user:
             return False
-        user.credits -= amount
+            
+        # 2. حماية إضافية: تحويل الرصيد إلى 0 إذا كان فارغاً (None) لمنع الانهيار
+        current_credits = user.credits or 0
+        
+        if current_credits < amount:
+            return False
+            
+        # 3. الخصم بطريقة رياضية آمنة
+        user.credits = current_credits - amount
+        
         tx = CreditTransaction(user_id=user.id, amount=amount, transaction_type='debit', job_id=job_id)
         db.session.add(tx)
         db.session.commit()
