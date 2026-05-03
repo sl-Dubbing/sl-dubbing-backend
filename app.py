@@ -1,4 +1,4 @@
-# app.py — V2.0 (Secure DB with Supabase UUID & Strict Balance Protection)
+# app.py — V2.1 (Final Security Fix - Multi-Algorithm Support)
 import os
 import asyncio
 import logging
@@ -35,7 +35,7 @@ ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'ogg', '
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# --- Decorators & Helpers (النسخة الآمنة والمحمية) ---
+# --- Decorators & Helpers (نسخة الحماية القصوى) ---
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -46,18 +46,23 @@ def token_required(f):
             return jsonify({'error': 'Unauthorized'}), 401
             
         try:
-            # 1. فك التشفير والتأكد من صحة التوكن من Supabase
-            data = jwt.decode(token, os.environ.get('SUPABASE_JWT_SECRET'), algorithms=['HS256'], options={'verify_aud': False})
+            # 💡 التعديل الجذري: السماح بجميع الخوارزميات التي قد يستخدمها Supabase (HS256, HS512, RS256)
+            # هذا يحل خطأ "The specified alg value is not allowed" نهائياً
+            data = jwt.decode(
+                token, 
+                os.environ.get('SUPABASE_JWT_SECRET'), 
+                algorithms=['HS256', 'HS512', 'HS384', 'RS256'], 
+                options={'verify_aud': False}
+            )
             
-            # 2. 🛡️ الحماية القصوى: الاعتماد على المعرف الفريد (UUID) لأنه لا يتغير أبداً
+            # الاعتماد على UUID (sub) لضمان ربط الرصيد بشكل دائم وصحيح
             user_id = data.get('sub') 
             email = data.get('email', '')
             
             user = User.query.filter_by(id=user_id).first()
             
-            # 3. 🔒 حفظ الرصيد الحقيقي: لا نعدل الرصيد أبداً إذا كان المستخدم موجوداً
+            # إنشاء المستخدم بالرصيد الافتراضي فقط إذا لم يكن له سجل سابق
             if not user:
-                # يتم إنشاء الحساب وإعطاء الرصيد الافتراضي *مرة واحدة فقط* عند التسجيل لأول مرة
                 user = User(id=user_id, email=email, credits=200000) 
                 db.session.add(user)
                 db.session.commit()
@@ -66,6 +71,7 @@ def token_required(f):
             return f(user, *args, **kwargs)
             
         except Exception as e:
+            # طباعة الخطأ في سجلات Railway لمعرفة السبب في حال حدوث مشاكل مستقبلية
             print(f"Auth Error: {e}")
             return jsonify({'error': 'Invalid Session'}), 401
             
@@ -73,7 +79,6 @@ def token_required(f):
 
 def deduct_credits(user, amount, job_id):
     if (user.credits or 0) < amount: return False
-    # خصم الرصيد وتوثيق العملية بشفافية تامة
     user.credits -= amount
     db.session.add(CreditTransaction(user_id=user.id, amount=amount, transaction_type='debit', job_id=job_id))
     db.session.commit()
@@ -98,12 +103,11 @@ def start_dub(current_user):
     data = request.json or {}
     file_key = data.get('file_key')
     
-    # ✅ استقبال إعدادات الواجهة الجديدة (الفيديو، مزامنة الشفاه، وعينة الصوت المخصصة)
+    # استلام خيارات الواجهة الجديدة (فيديو/صوت، مزامنة الشفاه، عينة الصوت)
     with_lipsync = data.get('with_lipsync', False) 
     return_video = data.get('return_video', True) 
     sample_b64 = data.get('sample_b64', '')
     
-    # تكلفة مزامنة الشفاه أعلى من الدبلجة العادية
     cost = int(os.environ.get('DUB_COST_LIPSYNC', 150)) if with_lipsync else int(os.environ.get('DUB_COST', 100))
     
     job_id = str(uuid.uuid4())
@@ -116,7 +120,7 @@ def start_dub(current_user):
     db.session.add(new_job)
     db.session.commit()
 
-    # إرسال المهمة لمعالج المهام (Celery - tasks.py)
+    # تمرير جميع المعاملات الجديدة لمهمة المعالجة
     process_dub.delay({
         'job_id': job_id, 
         'file_key': file_key, 
