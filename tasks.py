@@ -1,4 +1,4 @@
-# tasks.py — V6.0 (Auto-Routing to LipSync Factory)
+# tasks.py — V6.1 (Auto-Routing + Enhanced Voice Cloning)
 import os
 import logging
 from datetime import datetime
@@ -14,7 +14,7 @@ celery_app.conf.update(
     accept_content=['json'],
     result_serializer='json',
     task_track_started=True,
-    task_time_limit=2500, # 🚀 تمت زيادة الوقت ليسمح بعمليتي الدبلجة ومزامنة الشفاه
+    task_time_limit=2500, 
     task_soft_time_limit=2400,
 )
 
@@ -22,12 +22,11 @@ MODAL_DUBBING_URL = os.environ.get('MODAL_DUBBING_URL')
 MODAL_TTS_URL = os.environ.get('MODAL_TTS_URL')
 MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
 MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
-# 🚀 إضافة رابط مصنع الشفاه
 MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')
 
 
 def _build_presigned_url(file_key, expires=7200):
-    """يولّد رابط مؤقت من R2"""
+    """يولّد رابط مؤقت من R2 لضمان وصول Modal للملفات"""
     import boto3
     from botocore.client import Config
     s3 = boto3.client(
@@ -47,7 +46,7 @@ def _build_presigned_url(file_key, expires=7200):
 
 
 # ==========================================
-# 🎬 process_dub — الدبلجة ثم مزامنة الشفاه (الدمج الآلي)
+# 🎬 process_dub — الدبلجة مع تحسين النبرة
 # ==========================================
 @celery_app.task(bind=True, max_retries=2)
 def process_dub(self, *args, **kwargs):
@@ -61,7 +60,12 @@ def process_dub(self, *args, **kwargs):
     lang = payload.get('lang', 'ar')
     voice_id = payload.get('voice_id', 'source')
     sample_b64 = payload.get('sample_b64', '')
+    
+    # 🛠️ تحسين جودة النبرة: إجبار السيرفر على استخدام أفضل محرك (f5tts) عند اختيار الصوت الأصلي
     engine = payload.get('engine', '')
+    if voice_id == 'source' and not engine:
+        engine = 'f5tts'
+        logger.info(f"[job={job_id}] Auto-selected 'f5tts' for better voice cloning quality.")
 
     with app.app_context():
         job = DubbingJob.query.get(job_id)
@@ -80,7 +84,7 @@ def process_dub(self, *args, **kwargs):
                 raise Exception("No media_url or file_key available")
 
             # ---------------------------------------------------------
-            # المرحلة الأولى: الدبلجة الصوتية (من sl-dubbing-factory)
+            # المرحلة الأولى: الدبلجة الصوتية (Audio Dubbing)
             # ---------------------------------------------------------
             modal_payload = {
                 'media_url': media_url,
@@ -90,7 +94,7 @@ def process_dub(self, *args, **kwargs):
                 'engine': engine,
             }
 
-            logger.info(f"[job={job_id}] Phase 1: Audio Dubbing...")
+            logger.info(f"[job={job_id}] Phase 1: Audio Dubbing with {engine}...")
             r = requests.post(f"{MODAL_DUBBING_URL}/upload-from-url", json=modal_payload, timeout=1500)
 
             if r.status_code != 200:
@@ -101,18 +105,18 @@ def process_dub(self, *args, **kwargs):
                 raise Exception(data.get('error', 'Modal returned success=false'))
 
             dubbed_audio_url = data.get('audio_url')
-            final_output_url = dubbed_audio_url  # كقيمة افتراضية إذا فشلت المرحلة الثانية
+            final_output_url = dubbed_audio_url  
 
             # ---------------------------------------------------------
-            # المرحلة الثانية: مزامنة الشفاه والدمج (من sl-lipsync-factory)
+            # المرحلة الثانية: مزامنة الشفاه والدمج (LipSync)
             # ---------------------------------------------------------
             if MODAL_LIPSYNC_URL:
                 logger.info(f"[job={job_id}] Phase 2: LipSync & Video Merge...")
                 lipsync_payload = {
                     "media_url": media_url,
                     "dubbed_audio_url": dubbed_audio_url,
-                    "auto_lipsync": True,           # الذكاء الاصطناعي يقرر إذا كان يحتاج LipSync أو VoiceOver
-                    "preserve_background": True     # الحفاظ على المؤثرات والموسيقى
+                    "auto_lipsync": True,           
+                    "preserve_background": True     
                 }
                 
                 try:
@@ -121,18 +125,16 @@ def process_dub(self, *args, **kwargs):
                         ls_data = ls_r.json()
                         if ls_data.get('success'):
                             final_output_url = ls_data.get('output_url')
-                            logger.info(f"[job={job_id}] ✅ Phase 2 Done (Type: {ls_data.get('output_type')})")
+                            logger.info(f"[job={job_id}] ✅ LipSync Success (Type: {ls_data.get('output_type')})")
                         else:
-                            logger.warning(f"[job={job_id}] Phase 2 Logic Error: {ls_data.get('error')}. Falling back to Audio.")
+                            logger.warning(f"[job={job_id}] LipSync Skipped/Failed: {ls_data.get('error')}")
                     else:
-                        logger.warning(f"[job={job_id}] Phase 2 HTTP Error {ls_r.status_code}. Falling back to Audio.")
+                        logger.warning(f"[job={job_id}] LipSync HTTP Error {ls_r.status_code}")
                 except Exception as ls_e:
-                    logger.warning(f"[job={job_id}] Phase 2 Exception: {ls_e}. Falling back to Audio.")
-            else:
-                logger.info(f"[job={job_id}] MODAL_LIPSYNC_URL is not set. Skipping Phase 2.")
-
+                    logger.warning(f"[job={job_id}] LipSync Exception: {ls_e}")
+            
             # ---------------------------------------------------------
-            # حفظ النتيجة النهائية
+            # التحديث النهائي في قاعدة البيانات
             # ---------------------------------------------------------
             job.status = 'completed'
             job.output_url = final_output_url
@@ -140,7 +142,7 @@ def process_dub(self, *args, **kwargs):
             job.completed_at = datetime.utcnow()
             db.session.commit()
 
-            logger.info(f"[job={job_id}] 🎉 All Done!")
+            logger.info(f"[job={job_id}] 🎉 Process Finished Successfully!")
 
         except Exception as e:
             logger.exception(f"[job={job_id}] ❌ failed: {e}")
@@ -190,11 +192,9 @@ def process_smart_tts(self, *args, **kwargs):
                 'rate': rate, 'pitch': pitch,
             }
 
-            logger.info(f"[tts={job_id}] → Modal {MODAL_TTS_URL}{endpoint}")
-
             r = requests.post(f"{MODAL_TTS_URL}{endpoint}", json=modal_payload, timeout=600)
             if r.status_code != 200:
-                raise Exception(f"Modal HTTP {r.status_code}: {r.text[:300]}")
+                raise Exception(f"Modal HTTP {r.status_code}")
 
             data = r.json()
             if not data.get('success'):
@@ -204,7 +204,6 @@ def process_smart_tts(self, *args, **kwargs):
             job.output_url = data.get('audio_url')
             job.completed_at = datetime.utcnow()
             db.session.commit()
-            logger.info(f"[tts={job_id}] ✅ done")
 
         except Exception as e:
             logger.exception(f"[tts={job_id}] ❌ failed: {e}")
@@ -239,9 +238,7 @@ def process_stt(self, *args, **kwargs):
 
     with app.app_context():
         job = DubbingJob.query.get(job_id)
-        if not job:
-            logger.error(f"STT Job {job_id} not found")
-            return
+        if not job: return
 
         try:
             job.status = 'processing'
@@ -249,9 +246,6 @@ def process_stt(self, *args, **kwargs):
 
             if not media_url and (file_key or job.file_key):
                 media_url = _build_presigned_url(file_key or job.file_key)
-
-            if not media_url:
-                raise Exception("No media_url or file_key")
 
             base_url = MODAL_STT_PRECISE_URL if mode == 'precise' else MODAL_STT_URL
             endpoint = '/transcribe-precise' if mode == 'precise' else '/transcribe-from-url'
@@ -264,25 +258,19 @@ def process_stt(self, *args, **kwargs):
                 'format': 'all',
             }
 
-            logger.info(f"[stt={job_id}] → Modal {base_url}{endpoint}")
-
             r = requests.post(f"{base_url}{endpoint}", json=modal_payload, timeout=900)
             if r.status_code != 200:
-                raise Exception(f"Modal HTTP {r.status_code}: {r.text[:300]}")
+                raise Exception(f"Modal HTTP {r.status_code}")
 
             data = r.json()
-            if not data.get('success'):
-                raise Exception(data.get('error', 'Unknown'))
-
             job.status = 'completed'
             job.output_url = data.get('json_url') or data.get('text_url')
             job.engine = data.get('engine', mode)
             job.completed_at = datetime.utcnow()
             db.session.commit()
-            logger.info(f"[stt={job_id}] ✅ done")
 
         except Exception as e:
-            logger.exception(f"[stt={job_id}] ❌ failed: {e}")
+            logger.exception(f"[stt={job_id}] ❌ failed")
             try:
                 job.status = 'failed'
                 job.error_message = str(e)[:500]
@@ -293,7 +281,6 @@ def process_stt(self, *args, **kwargs):
                 self.retry(exc=e, countdown=10)
             except Exception:
                 pass
-
 
 # Backward compat alias
 process_tts = process_smart_tts
