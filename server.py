@@ -1,4 +1,4 @@
-# server.py — V3.3 The Master Version
+# server.py — V3.4 The Ultimate Master Version
 import os
 import uuid
 import logging
@@ -59,7 +59,7 @@ def token_required(f):
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'version': 'v3.3-master'})
+    return jsonify({'status': 'ok', 'version': 'v3.4-ultimate'})
 
 @app.route('/api/user/credits', methods=['GET'])
 @token_required
@@ -144,7 +144,7 @@ def start_dubbing(user):
     )
     return jsonify({'success': True, 'job_id': job.id})
 
-# =================🎙️ تحويل النص=================
+# =================🎙️ تحويل النص لصوت (TTS)=================
 @app.route('/api/tts', methods=['POST'])
 @token_required
 def start_tts(user):
@@ -190,12 +190,54 @@ def tts_quick(user):
 
     return Response(stream_with_context(generate()), mimetype='audio/mpeg')
 
+# =================📝 تحويل الصوت لنص (STT)=================
+@app.route('/api/stt', methods=['POST'])
+@token_required
+def start_stt(user):
+    data = request.get_json() or {}
+    file_key = data.get('file_key')
+    if not file_key: return jsonify({'error': 'file_key missing'}), 400
+    
+    media_url = s3.generate_presigned_url('get_object', Params={'Bucket': R2_BUCKET, 'Key': file_key}, ExpiresIn=7200)
+    
+    job = DubbingJob(
+        user_id=user.id, kind='stt', lang=data.get('language', 'auto'),
+        status='queued', input_key=file_key, custom_name="تفريغ صوتي",
+        created_at=datetime.utcnow()
+    )
+    db.session.add(job)
+    db.session.commit()
+    
+    process_stt.delay(
+        job_id=job.id, media_url=media_url, 
+        language=data.get('language', 'auto'),
+        mode=data.get('mode', 'fast'),
+        diarize=data.get('diarize', False),
+        translate=data.get('translate', False)
+    )
+    return jsonify({'success': True, 'job_id': job.id})
+
+# =================📡 فحص حالة المهام=================
 @app.route('/api/job/<int:job_id>', methods=['GET'])
 @token_required
 def job_status(user, job_id):
     job = DubbingJob.query.filter_by(id=job_id, user_id=user.id).first()
     if not job: return jsonify({'error': 'Not found'}), 404
-    return jsonify({'id': job.id, 'status': job.status, 'audio_url': job.audio_url, 'error': job.error})
+    
+    response_data = {'id': job.id, 'status': job.status, 'audio_url': job.audio_url, 'error': job.error}
+    
+    # 🌟 قراءة نصوص STT وإرسالها للواجهة مباشرة
+    if job.kind == 'stt' and job.status == 'completed' and job.audio_url:
+        try:
+            r = _requests.get(job.audio_url)
+            if r.status_code == 200:
+                stt_data = r.json()
+                response_data['segments'] = stt_data.get('segments', [])
+                response_data['transcript'] = stt_data.get('transcript', '')
+        except Exception as e:
+            logger.error(f"Failed to fetch STT JSON: {e}")
+            
+    return jsonify(response_data)
 
 if __name__ == '__main__':
     with app.app_context(): db.create_all()
