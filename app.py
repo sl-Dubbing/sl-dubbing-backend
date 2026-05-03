@@ -10,7 +10,8 @@ from functools import wraps
 
 import jwt
 import boto3
-from botocore.client import Config, BotoCoreError, ClientError
+from botocore.client import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
