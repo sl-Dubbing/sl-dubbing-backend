@@ -1,4 +1,4 @@
-# tasks.py — V6.3 (Full Version - Crash Fix)
+# tasks.py — V6.4 (Full Version - Crash Fix + Smart Video/Audio Switch)
 import os
 import logging
 from datetime import datetime
@@ -43,7 +43,7 @@ def _build_presigned_url(file_key, expires=7200):
     )
 
 # ==========================================
-# 🎬 process_dub
+# 🎬 process_dub — تم تحديث المنطق ليدعم خيار الفيديو/الصوت
 # ==========================================
 @celery_app.task(bind=True, max_retries=2)
 def process_dub(self, *args, **kwargs):
@@ -57,7 +57,10 @@ def process_dub(self, *args, **kwargs):
     lang = payload.get('lang', 'ar')
     voice_id = payload.get('voice_id', 'source')
     sample_b64 = payload.get('sample_b64', '')
-    with_lipsync = payload.get('with_lipsync', False) # خيار المستخدم
+    
+    # 🛠️ الخيارات الجديدة القادمة من الواجهة
+    with_lipsync = payload.get('with_lipsync', False) # خيار مزامنة الشفاه
+    video_output = payload.get('video_output', True) # خيار إخراج فيديو (الجديد)
     
     engine = payload.get('engine', '')
     if voice_id == 'source' and not engine:
@@ -76,41 +79,67 @@ def process_dub(self, *args, **kwargs):
 
             if not media_url: raise Exception("No media_url available")
 
-            # المرحلة 1: الدبلجة
+            # ---------------------------------------------------------
+            # المرحلة 1: الدبلجة الصوتية (Audio Dubbing) - دائماً تعمل
+            # ---------------------------------------------------------
             modal_payload = {
                 'media_url': media_url, 'lang': lang,
                 'voice_id': voice_id, 'sample_b64': sample_b64, 'engine': engine,
             }
             
+            logger.info(f"[job={job_id}] Phase 1: Audio Dubbing started...")
             r = requests.post(f"{MODAL_DUBBING_URL}/upload-from-url", json=modal_payload, timeout=1500)
             if r.status_code != 200: raise Exception(f"Dubbing HTTP {r.status_code}")
             data = r.json()
             if not data.get('success'): raise Exception(data.get('error'))
             
-            final_output_url = data.get('audio_url')
+            # نحتفظ برابط الصوت المدبلج كناتج افتراضي
+            dubbed_audio_url = data.get('audio_url')
+            final_output_url = dubbed_audio_url
 
-            # المرحلة 2: مزامنة الشفاه (فقط إذا طلبها المستخدم)
-            if with_lipsync and MODAL_LIPSYNC_URL:
+            # ---------------------------------------------------------
+            # المرحلة 2 الذكية: دمج الفيديو ومزامنة الشفاه (LipSync/Merge)
+            # 💡 تعمل فقط إذا طلب المستخدم "ناتج فيديو"
+            # ---------------------------------------------------------
+            if video_output and MODAL_LIPSYNC_URL:
+                logger.info(f"[job={job_id}] Phase 2: Video Processing started (LipSync: {with_lipsync})...")
                 lipsync_payload = {
-                    "media_url": media_url, "dubbed_audio_url": final_output_url,
-                    "auto_lipsync": True, "preserve_background": True     
+                    "media_url": media_url,
+                    "dubbed_audio_url": dubbed_audio_url,
+                    "preserve_background": True,
+                    # المنطق الذكي: إذا طلب LipSync نفعله، وإلا نقوم بدمج الصوت فقط على الفيديو
+                    "auto_lipsync": False, 
+                    "force_lipsync": with_lipsync 
                 }
                 try:
                     ls_r = requests.post(f"{MODAL_LIPSYNC_URL}/dub-video", json=lipsync_payload, timeout=1800)
                     if ls_r.status_code == 200:
                         ls_data = ls_r.json()
                         if ls_data.get('success'):
+                            # إذا نجح الدمج، يصبح الناتج النهائي هو رابط الفيديو
                             final_output_url = ls_data.get('output_url')
+                            logger.info(f"[job={job_id}] Video processed successfully.")
+                        else:
+                            logger.warning(f"[job={job_id}] Video processing skipped: {ls_data.get('error')}")
+                    else:
+                        logger.warning(f"[job={job_id}] Video service HTTP Error {ls_r.status_code}")
                 except Exception as e:
-                    logger.warning(f"LipSync Exception: {e}")
+                    logger.warning(f"[job={job_id}] Video processing exception: {e}")
+            else:
+                logger.info(f"[job={job_id}] Skipped Stage 2 (User requested Audio only).")
 
+            # ---------------------------------------------------------
+            # التحديث النهائي
+            # ---------------------------------------------------------
             job.status = 'completed'
             job.output_url = final_output_url
             job.engine = data.get('engine_used', engine or 'auto')
             job.completed_at = datetime.utcnow()
             db.session.commit()
+            logger.info(f"[job={job_id}] Job completed successfully.")
 
         except Exception as e:
+            logger.error(f"[job={job_id}] Job failed: {e}")
             try:
                 job.status = 'failed'
                 job.error_message = str(e)[:500]
@@ -118,7 +147,7 @@ def process_dub(self, *args, **kwargs):
             except Exception: pass
 
 # ==========================================
-# 🎙️ process_smart_tts (الدالة التي كانت مفقودة وسببت الانهيار)
+# 🎙️ process_smart_tts
 # ==========================================
 @celery_app.task(bind=True, max_retries=2)
 def process_smart_tts(self, *args, **kwargs):
@@ -164,7 +193,7 @@ def process_smart_tts(self, *args, **kwargs):
             except Exception: pass
 
 # ==========================================
-# 🎙️ process_stt (الدالة التي كانت مفقودة)
+# 🎙️ process_stt
 # ==========================================
 @celery_app.task(bind=True, max_retries=2)
 def process_stt(self, *args, **kwargs):
