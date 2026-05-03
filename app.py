@@ -42,7 +42,11 @@ ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
 CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS)
 
 if LIMITER_AVAILABLE:
-    limiter = Limiter(app, key_func=get_remote_address, default_limits=["500 per day", "100 per minute"])
+    limiter = Limiter(
+        key_func=get_remote_address,
+        default_limits=["500 per day", "100 per minute"]
+    )
+    limiter.init_app(app)
     logger.info("Flask-Limiter enabled")
 else:
     limiter = None
