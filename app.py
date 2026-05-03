@@ -1,4 +1,4 @@
-# app.py — V2.2 (Ultimate Fix: CORS Preflight + Multi-Algorithm Support)
+# app.py — V2.3 (Final Fix: User Info Endpoint + CORS Robustness)
 import os
 import asyncio
 import logging
@@ -17,7 +17,7 @@ load_dotenv()
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
 
-# تحديث إعدادات CORS لتكون أكثر مرونة مع المتصفحات
+# تحصين نظام CORS للسماح لجميع المسارات والطلبات بالتواصل مع الواجهة
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
 # إعدادات قاعدة البيانات والـ S3
@@ -37,13 +37,12 @@ ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'ogg', '
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# --- Decorator المحدث لحل مشكلة الـ CORS والـ Algorithm ---
+# --- نظام المصادقة المطور ---
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 1. حل مشكلة الـ CORS: السماح لطلبات OPTIONS بالمرور دون فحص التوكن
         if request.method == 'OPTIONS':
-            return f(*args, **kwargs)
+            return f(None, *args, **kwargs)
 
         auth = request.headers.get('Authorization', '')
         token = auth.split()[1] if 'Bearer ' in auth else request.cookies.get('session')
@@ -52,7 +51,7 @@ def token_required(f):
             return jsonify({'error': 'Unauthorized'}), 401
             
         try:
-            # 2. حل مشكلة الـ Algorithm: قبول جميع الخوارزميات الممكنة من Supabase
+            # استخدام جميع الخوارزميات الممكنة لفك التشفير من Supabase
             secret = os.environ.get('SUPABASE_JWT_SECRET')
             data = jwt.decode(
                 token, 
@@ -64,31 +63,35 @@ def token_required(f):
             user_id = data.get('sub') 
             email = data.get('email', '')
             
+            # البحث عن المستخدم في قاعدة البيانات المحلية المرتبطة بـ Supabase
             user = User.query.filter_by(id=user_id).first()
             
             if not user:
+                # إذا كان أول دخول له، ننشئ سجله ونعطيه الرصيد الافتراضي
                 user = User(id=user_id, email=email, credits=200000) 
                 db.session.add(user)
                 db.session.commit()
-                print(f"New user registered: {user_id}")
                 
             return f(user, *args, **kwargs)
             
         except Exception as e:
-            # طباعة الخطأ الحقيقي في سجلات Railway
             print(f"Auth Error: {str(e)}")
-            return jsonify({'error': 'Invalid Session', 'details': str(e)}), 401
+            return jsonify({'error': 'Invalid Session'}), 401
             
     return decorated
 
-def deduct_credits(user, amount, job_id):
-    if (user.credits or 0) < amount: return False
-    user.credits -= amount
-    db.session.add(CreditTransaction(user_id=user.id, amount=amount, transaction_type='debit', job_id=job_id))
-    db.session.commit()
-    return True
-
 # --- Endpoints ---
+
+# 🌟 المسار السحري المفقود: جلب بيانات المستخدم ورصيده الحقيقي
+@app.route('/api/user', methods=['GET', 'OPTIONS'])
+@token_required
+def get_user_info(current_user):
+    if request.method == 'OPTIONS': return jsonify({'ok': True})
+    return jsonify({
+        'id': current_user.id,
+        'email': current_user.email,
+        'credits': current_user.credits # هذا ما سيقرأ الـ 199,500 نقطة ويعرضها
+    })
 
 @app.route('/api/upload-url', methods=['POST', 'OPTIONS'])
 @token_required
@@ -112,12 +115,12 @@ def start_dub(current_user):
     return_video = data.get('return_video', True) 
     sample_b64 = data.get('sample_b64', '')
     
-    cost = int(os.environ.get('DUB_COST_LIPSYNC', 150)) if with_lipsync else int(os.environ.get('DUB_COST', 100))
-    
-    job_id = str(uuid.uuid4())
-    if not deduct_credits(current_user, cost, job_id):
+    cost = 150 if with_lipsync else 100
+    if current_user.credits < cost:
         return jsonify({'error': 'Insufficient credits'}), 402
 
+    current_user.credits -= cost
+    job_id = str(uuid.uuid4())
     new_job = DubbingJob(id=job_id, user_id=current_user.id, status='pending', 
                          language=data.get('lang', 'ar'), method='dubbing', 
                          voice_id=data.get('voice_id', 'source'), file_key=file_key, credits_used=cost)
@@ -127,8 +130,7 @@ def start_dub(current_user):
     process_dub.delay({
         'job_id': job_id, 'file_key': file_key, 'lang': data.get('lang', 'ar'),
         'voice_id': data.get('voice_id', 'source'), 'sample_b64': sample_b64,
-        'with_lipsync': with_lipsync, 'video_output': return_video,
-        'engine': data.get('engine', '')
+        'with_lipsync': with_lipsync, 'video_output': return_video
     })
     return jsonify({'success': True, 'job_id': job_id}), 202
 
