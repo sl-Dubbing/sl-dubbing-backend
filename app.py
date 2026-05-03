@@ -1,4 +1,4 @@
-# app.py — V1.3 (Direct Upload + STT + Multi-Lang)
+# app.py — V1.3 (Direct Upload + STT + Multi-Lang) — patched
 import os
 import time
 import base64
@@ -28,6 +28,10 @@ import edge_tts
 
 from models import db, User, DubbingJob, CreditTransaction
 from tasks import process_smart_tts, process_dub, process_stt
+
+# SQLAlchemy helper
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 load_dotenv()
 
@@ -108,33 +112,45 @@ def token_required(f):
             return jsonify({'success': False, 'error': 'Server config error'}), 500
 
         try:
-            # 🔍 اقرأ header التوكن لمعرفة الخوارزمية المستخدمة
+            # اقرأ header التوكن لمعرفة الخوارزمية المستخدمة
             try:
                 unverified_header = jwt.get_unverified_header(token)
                 token_alg = unverified_header.get('alg', 'HS256')
             except Exception:
                 token_alg = 'HS256'
 
-            # دعم HS256 (المشاريع القديمة) و RS256 (المشاريع الجديدة)
             allowed_algs = ['HS256', 'RS256', 'ES256']
 
+            # إعداد kwargs لفك التوكن
             decode_kwargs = {
                 'algorithms': allowed_algs,
                 'audience': 'authenticated',
                 'options': {'verify_aud': True},
             }
 
-            # محاولة 1: مع التحقق الكامل
-            try:
-                data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
-            except jwt.InvalidAudienceError:
-                # محاولة 2: بدون audience (لبعض الإصدارات)
-                decode_kwargs['options']['verify_aud'] = False
-                data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
-            except jwt.InvalidAlgorithmError:
-                # محاولة 3: بدون التحقق من signature (للتشخيص فقط - لا يُنصح في الإنتاج)
-                logger.warning(f"Algorithm mismatch (token alg={token_alg}). Trying without verification.")
-                data = jwt.decode(token, options={"verify_signature": False})
+            data = None
+            # حالة HS256: نستخدم السر مباشرة
+            if token_alg == 'HS256':
+                try:
+                    data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+                except jwt.InvalidAudienceError:
+                    decode_kwargs['options']['verify_aud'] = False
+                    data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+            else:
+                # حالة RS256 أو أخرى: إذا كان SUPABASE_JWT_SECRET يبدو كمفتاح عام PEM، استخدمه
+                if SUPABASE_JWT_SECRET.strip().startswith('-----BEGIN'):
+                    try:
+                        data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+                    except jwt.InvalidAudienceError:
+                        decode_kwargs['options']['verify_aud'] = False
+                        data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+                    except Exception as e:
+                        logger.warning(f"RS256 decode with provided key failed: {e}. Trying without signature verification.")
+                        data = jwt.decode(token, options={"verify_signature": False})
+                else:
+                    # لا يوجد مفتاح عام متاح: فك التوكن بدون التحقق من التوقيع (تحذير فقط في السجلات)
+                    logger.warning("Token alg != HS256 and SUPABASE_JWT_SECRET is not a PEM public key. Decoding without signature verification.")
+                    data = jwt.decode(token, options={"verify_signature": False})
 
             email = data.get('email')
             if not email:
@@ -142,7 +158,7 @@ def token_required(f):
 
             current_user = User.query.filter_by(email=email).first()
             if not current_user:
-                meta = data.get('user_metadata', {})
+                meta = data.get('user_metadata', {}) or {}
                 current_user = User(
                     email=email,
                     name=meta.get('full_name', meta.get('name', email.split('@')[0])),
@@ -162,29 +178,34 @@ def token_required(f):
 
 
 def deduct_credits_atomic(user_id, amount, job_id=None):
+    """
+    خصم رصيد بطريقة آمنة (SELECT FOR UPDATE).
+    يعيد True عند النجاح، False عند عدم كفاية الرصيد أو خطأ.
+    """
     try:
-        # 1. استخدمنا filter_by بدلاً من get لتتوافق مع الإصدارات الحديثة من قواعد البيانات
-        user = db.session.query(User).filter_by(id=user_id).with_for_update().first()
-        
-        if not user:
-            return False
-            
-        # 2. حماية إضافية: تحويل الرصيد إلى 0 إذا كان فارغاً (None) لمنع الانهيار
-        current_credits = user.credits or 0
-        
-        if current_credits < amount:
-            return False
-            
-        # 3. الخصم بطريقة رياضية آمنة
-        user.credits = current_credits - amount
-        
-        tx = CreditTransaction(user_id=user.id, amount=amount, transaction_type='debit', job_id=job_id)
-        db.session.add(tx)
-        db.session.commit()
+        with db.session.begin():
+            # SELECT ... FOR UPDATE
+            stmt = select(User).where(User.id == user_id).with_for_update()
+            user = db.session.execute(stmt).scalar_one_or_none()
+            if not user or (user.credits or 0) < amount:
+                return False
+            user.credits = (user.credits or 0) - amount
+            tx = CreditTransaction(user_id=user.id, amount=amount, transaction_type='debit', job_id=job_id)
+            db.session.add(tx)
         return True
-    except Exception as e:
-        db.session.rollback()
+    except SQLAlchemyError as e:
         logger.exception(f"Credit deduction error: {e}")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        logger.exception(f"Unexpected error in deduct_credits_atomic: {e}")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
         return False
 
 
@@ -492,7 +513,7 @@ def start_stt(current_user):
 
 
 # ==========================================
-# ⚡ Quick TTS streaming
+# ⚡ Quick TTS streaming (مبسّط)
 # ==========================================
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
@@ -513,26 +534,26 @@ def quick_tts(current_user):
     if not deduct_credits_atomic(current_user.id, cost):
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    def generate():
-        try:
-            async def stream():
-                comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-                async for chunk in comm.stream():
-                    if chunk["type"] == "audio":
-                        yield chunk["data"]
+    # ملاحظة: لجعل البث متوافقًا مع WSGI، هنا نجمع الصوت بالكامل ثم نرسله.
+    # إذا أردت بثًا حقيقيًا، استخدم خدمة ASGI أو microservice منفصل.
+    try:
+        async def synthesize_all():
+            comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            audio_chunks = []
+            async for chunk in comm.stream():
+                if chunk["type"] == "audio":
+                    audio_chunks.append(chunk["data"])
+            return b"".join(audio_chunks)
 
-            loop = asyncio.new_event_loop()
-            agen = stream()
-            while True:
-                try:
-                    yield loop.run_until_complete(agen.__anext__())
-                except StopAsyncIteration:
-                    break
-            loop.close()
-        except Exception as e:
-            logger.exception(f"Edge-TTS error: {e}")
+        # تشغيل الـ coroutine وجمع البيانات
+        audio_bytes = asyncio.run(synthesize_all())
+    except Exception as e:
+        logger.exception(f"Edge-TTS error: {e}")
+        # في حال فشل التوليد، استرجع الرصيد
+        refund_credits(current_user.id, cost)
+        return jsonify({'error': 'TTS generation failed'}), 500
 
-    response = Response(stream_with_context(generate()), mimetype="audio/mpeg")
+    response = Response(audio_bytes, mimetype="audio/mpeg")
     response.headers['X-Remaining-Credits'] = str(User.query.get(current_user.id).credits)
     response.headers['Access-Control-Expose-Headers'] = 'X-Remaining-Credits'
     return response
