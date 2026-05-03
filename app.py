@@ -1,4 +1,4 @@
-# app.py — V1.8 (Support Manual LipSync Toggle)
+# app.py — V1.9 (Auto-healing DB + Video/Audio toggle support)
 import os
 import asyncio
 import logging
@@ -18,7 +18,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
 CORS(app, supports_credentials=True, origins="*")
 
-# إعدادات قاعدة البيانات والـ S3 (نفس الكود السابق لضمان الاستقرار)
+# إعدادات قاعدة البيانات والـ S3
 DATABASE_URL = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -41,13 +41,32 @@ def token_required(f):
     def decorated(*args, **kwargs):
         auth = request.headers.get('Authorization', '')
         token = auth.split()[1] if 'Bearer ' in auth else request.cookies.get('session')
-        if not token: return jsonify({'error': 'Unauthorized'}), 401
+        
+        if not token: 
+            return jsonify({'error': 'Unauthorized'}), 401
+            
         try:
+            # 1. فك التشفير والتأكد من صحة التوكن من Supabase
             data = jwt.decode(token, os.environ.get('SUPABASE_JWT_SECRET'), algorithms=['HS256'], options={'verify_aud': False})
-            user = User.query.filter_by(email=data.get('email')).first()
-            if not user: raise Exception()
+            email = data.get('email')
+            
+            # 2. البحث عن المستخدم في قاعدة البيانات
+            user = User.query.filter_by(email=email).first()
+            
+            # 3. 💡 [الحل السحري]: الشفاء الذاتي للسيرفر (إنشاء المستخدم تلقائياً إذا فُقد)
+            if not user:
+                user_id = data.get('sub') # معرف المستخدم الأصلي
+                user = User(id=user_id, email=email, credits=200000) # تعويض الرصيد بـ 200 ألف نقطة
+                db.session.add(user)
+                db.session.commit()
+                print(f"Auto-created missing user: {email}")
+                
             return f(user, *args, **kwargs)
-        except: return jsonify({'error': 'Invalid Session'}), 401
+            
+        except Exception as e:
+            print(f"Auth Error: {e}")
+            return jsonify({'error': 'Invalid Session'}), 401
+            
     return decorated
 
 def deduct_credits(user, amount, job_id):
@@ -75,8 +94,13 @@ def get_upload_url(current_user):
 def start_dub(current_user):
     data = request.json or {}
     file_key = data.get('file_key')
-    with_lipsync = data.get('with_lipsync', False) # ✅ الزر الجديد من الواجهة
     
+    # ✅ استقبال إعدادات الواجهة الجديدة (الفيديو، مزامنة الشفاه، وعينة الصوت المخصصة)
+    with_lipsync = data.get('with_lipsync', False) 
+    return_video = data.get('return_video', True) 
+    sample_b64 = data.get('sample_b64', '')
+    
+    # تكلفة مزامنة الشفاه أعلى من الدبلجة العادية
     cost = int(os.environ.get('DUB_COST_LIPSYNC', 150)) if with_lipsync else int(os.environ.get('DUB_COST', 100))
     
     job_id = str(uuid.uuid4())
@@ -89,9 +113,15 @@ def start_dub(current_user):
     db.session.add(new_job)
     db.session.commit()
 
+    # إرسال المهمة لمعالج المهام (Celery - tasks.py)
     process_dub.delay({
-        'job_id': job_id, 'file_key': file_key, 'lang': data.get('lang', 'ar'),
-        'voice_id': data.get('voice_id', 'source'), 'with_lipsync': with_lipsync, # ✅ تمرير الخيار للمهمة
+        'job_id': job_id, 
+        'file_key': file_key, 
+        'lang': data.get('lang', 'ar'),
+        'voice_id': data.get('voice_id', 'source'), 
+        'sample_b64': sample_b64,                # تمرير عينة الصوت إذا تم رفعها
+        'with_lipsync': with_lipsync,            # تمرير رغبة مزامنة الشفاه
+        'video_output': return_video,            # تمرير رغبة (فيديو / صوت) لـ tasks.py
         'engine': data.get('engine', '')
     })
     return jsonify({'success': True, 'job_id': job_id}), 202
