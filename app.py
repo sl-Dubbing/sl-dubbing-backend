@@ -1,4 +1,4 @@
-# app.py — V1.9 (Auto-healing DB + Video/Audio toggle support + Auto Recharge)
+# app.py — V2.0 (Secure DB with Supabase UUID & Strict Balance Protection)
 import os
 import asyncio
 import logging
@@ -35,7 +35,7 @@ ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'ogg', '
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# --- Decorators & Helpers ---
+# --- Decorators & Helpers (النسخة الآمنة والمحمية) ---
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -48,22 +48,20 @@ def token_required(f):
         try:
             # 1. فك التشفير والتأكد من صحة التوكن من Supabase
             data = jwt.decode(token, os.environ.get('SUPABASE_JWT_SECRET'), algorithms=['HS256'], options={'verify_aud': False})
-            email = data.get('email')
             
-            # 2. البحث عن المستخدم في قاعدة البيانات
-            user = User.query.filter_by(email=email).first()
+            # 2. 🛡️ الحماية القصوى: الاعتماد على المعرف الفريد (UUID) لأنه لا يتغير أبداً
+            user_id = data.get('sub') 
+            email = data.get('email', '')
             
-            # 3. 💡 [الحل السحري]: الشفاء الذاتي للسيرفر (إنشاء المستخدم أو شحن رصيده إذا كان صفر)
+            user = User.query.filter_by(id=user_id).first()
+            
+            # 3. 🔒 حفظ الرصيد الحقيقي: لا نعدل الرصيد أبداً إذا كان المستخدم موجوداً
             if not user:
-                user_id = data.get('sub') # معرف المستخدم الأصلي
-                user = User(id=user_id, email=email, credits=200000) # تعويض الرصيد بـ 200 ألف نقطة
+                # يتم إنشاء الحساب وإعطاء الرصيد الافتراضي *مرة واحدة فقط* عند التسجيل لأول مرة
+                user = User(id=user_id, email=email, credits=200000) 
                 db.session.add(user)
                 db.session.commit()
-                print(f"Auto-created missing user: {email}")
-            elif user.credits is None or user.credits <= 0:
-                user.credits = 200000 # إعادة شحن الرصيد فوراً إذا كان صفر
-                db.session.commit()
-                print(f"Auto-recharged existing user: {email}")
+                print(f"New user registered securely: {user_id}")
                 
             return f(user, *args, **kwargs)
             
@@ -75,6 +73,7 @@ def token_required(f):
 
 def deduct_credits(user, amount, job_id):
     if (user.credits or 0) < amount: return False
+    # خصم الرصيد وتوثيق العملية بشفافية تامة
     user.credits -= amount
     db.session.add(CreditTransaction(user_id=user.id, amount=amount, transaction_type='debit', job_id=job_id))
     db.session.commit()
@@ -123,9 +122,9 @@ def start_dub(current_user):
         'file_key': file_key, 
         'lang': data.get('lang', 'ar'),
         'voice_id': data.get('voice_id', 'source'), 
-        'sample_b64': sample_b64,                # تمرير عينة الصوت إذا تم رفعها
-        'with_lipsync': with_lipsync,            # تمرير رغبة مزامنة الشفاه
-        'video_output': return_video,            # تمرير رغبة (فيديو / صوت) لـ tasks.py
+        'sample_b64': sample_b64,
+        'with_lipsync': with_lipsync,
+        'video_output': return_video,
         'engine': data.get('engine', '')
     })
     return jsonify({'success': True, 'job_id': job_id}), 202
