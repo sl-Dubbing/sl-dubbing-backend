@@ -1,4 +1,4 @@
-# app.py — V1.1 (Atomic Credits, Safer Uploads, Edge-TTS Fixes)
+# app.py — V1.2 (Atomic Credits, Safer Uploads, True TTS Streaming)
 import os
 import time
 import base64
@@ -129,7 +129,6 @@ def deduct_credits_atomic(user_id: int, amount: int, job_id: str = None) -> bool
     Use SELECT FOR UPDATE to avoid race conditions.
     """
     try:
-        # lock the user row
         user = db.session.query(User).with_for_update().get(user_id)
         if not user or (user.credits or 0) < amount:
             return False
@@ -178,7 +177,6 @@ def start_dubbing_route(current_user):
     if content_length and content_length > max_bytes:
         return jsonify({"error": "حجم الملف أكبر من المسموح"}), 413
 
-    # Create job first so we can link the credit transaction
     new_job = DubbingJob(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -188,14 +186,12 @@ def start_dubbing_route(current_user):
         credits_used=cost
     )
     db.session.add(new_job)
-    db.session.flush()  # ensure new_job.id is available
+    db.session.flush() 
 
-    # Deduct credits atomically linked to job
     if not deduct_credits_atomic(current_user.id, cost, job_id=new_job.id):
         db.session.rollback()
         return jsonify({"error": "رصيد غير كافٍ"}), 402
 
-    # Upload file with error handling
     file_key = f"uploads/{uuid.uuid4()}_{filename}"
     try:
         file.stream.seek(0)
@@ -203,9 +199,7 @@ def start_dubbing_route(current_user):
     except (BotoCoreError, ClientError, Exception) as e:
         db.session.rollback()
         logger.exception("File upload failed user_id=%s job_id=%s: %s", current_user.id, new_job.id, e)
-        # refund
         try:
-            # create refund transaction
             u = User.query.get(current_user.id)
             if u:
                 u.credits = (u.credits or 0) + cost
@@ -216,11 +210,10 @@ def start_dubbing_route(current_user):
             logger.exception("Refund failed for user_id=%s job_id=%s", current_user.id, new_job.id)
         return jsonify({"error": "فشل رفع الملف"}), 500
 
-    # finalize job record and enqueue
     try:
         new_job.file_key = file_key
         new_job.status = 'processing'
-        db.session.add(new_job)
+        # تمت إزالة السطر المكرر db.session.add(new_job)
         db.session.commit()
     except Exception as e:
         db.session.rollback()
@@ -240,22 +233,7 @@ def start_dubbing_route(current_user):
 
     return jsonify({"success": True, "job_id": new_job.id}), 202
 
-# Helper to run edge-tts safely
-def _edge_tts_stream(text, voice, rate, pitch):
-    async def _run():
-        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                yield chunk["data"]
-    # Use asyncio.run to avoid creating persistent event loops in WSGI workers
-    return asyncio.run(_collect_chunks(_run()))
-
-async def _collect_chunks(coro):
-    chunks = []
-    async for c in coro:
-        chunks.append(c)
-    return chunks
-
+# ✅ تم تحسين هذه الدالة لتسمح بالبث الحقيقي (True Streaming)
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
 @json_required
@@ -272,16 +250,26 @@ def quick_tts(current_user):
         return jsonify({"error": "النص طويل جداً"}), 400
 
     cost = 1
-    # create a pseudo-job for tracking optional (not required for quick TTS)
     if not deduct_credits_atomic(current_user.id, cost):
         return jsonify({"error": "رصيدك غير كافٍ"}), 402
 
     def generate():
         try:
-            # run edge-tts and stream chunks
-            chunks = _edge_tts_stream(text, voice, rate, pitch)
-            for chunk in chunks:
-                yield chunk
+            # تشغيل الحلقة غير المتزامنة لضمان خروج البيانات دفعة دفعة للمتصفح
+            async def stream():
+                communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        yield chunk["data"]
+
+            loop = asyncio.new_event_loop()
+            agen = stream()
+            while True:
+                try:
+                    yield loop.run_until_complete(agen.__anext__())
+                except StopAsyncIteration:
+                    break
+            loop.close()
         except Exception as e:
             logger.exception("Edge-TTS Error user_id=%s: %s", current_user.id, e)
 
@@ -300,7 +288,6 @@ def start_smart_tts(current_user):
         return jsonify({"error": "النص غير موجود"}), 400
 
     cost = 10
-    # create job first
     new_job = DubbingJob(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -317,7 +304,7 @@ def start_smart_tts(current_user):
         return jsonify({"error": "رصيدك غير كافٍ"}), 402
 
     try:
-        db.session.add(new_job)
+        # تمت إزالة السطر المكرر db.session.add(new_job)
         db.session.commit()
     except Exception as e:
         db.session.rollback()
