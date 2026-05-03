@@ -14,7 +14,10 @@ class User(db.Model):
 
 class DubbingJob(db.Model):
     __tablename__ = 'dubbing_jobs'
-    id = db.Column(db.Integer, primary_key=True)
+    
+    # ✅ تم الإصلاح هنا: تحويل id إلى String ليتوافق مع قاعدة البيانات
+    id = db.Column(db.String(36), primary_key=True)
+    
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     kind = db.Column(db.String(50), default='dub') 
     lang = db.Column(db.String(20))
