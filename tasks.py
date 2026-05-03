@@ -1,4 +1,4 @@
-# tasks.py — V5.0 (متوافق مع app.py + models.py)
+# tasks.py — V6.0 (Auto-Routing to LipSync Factory)
 import os
 import logging
 from datetime import datetime
@@ -14,14 +14,16 @@ celery_app.conf.update(
     accept_content=['json'],
     result_serializer='json',
     task_track_started=True,
-    task_time_limit=1800,
-    task_soft_time_limit=1500,
+    task_time_limit=2500, # 🚀 تمت زيادة الوقت ليسمح بعمليتي الدبلجة ومزامنة الشفاه
+    task_soft_time_limit=2400,
 )
 
 MODAL_DUBBING_URL = os.environ.get('MODAL_DUBBING_URL')
 MODAL_TTS_URL = os.environ.get('MODAL_TTS_URL')
 MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
 MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
+# 🚀 إضافة رابط مصنع الشفاه
+MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')
 
 
 def _build_presigned_url(file_key, expires=7200):
@@ -45,7 +47,7 @@ def _build_presigned_url(file_key, expires=7200):
 
 
 # ==========================================
-# 🎬 process_dub — للدبلجة
+# 🎬 process_dub — الدبلجة ثم مزامنة الشفاه (الدمج الآلي)
 # ==========================================
 @celery_app.task(bind=True, max_retries=2)
 def process_dub(self, *args, **kwargs):
@@ -71,13 +73,15 @@ def process_dub(self, *args, **kwargs):
             job.status = 'processing'
             db.session.commit()
 
-            # توليد URL إذا لم يصلنا
             if not media_url and (file_key or job.file_key):
                 media_url = _build_presigned_url(file_key or job.file_key)
 
             if not media_url:
                 raise Exception("No media_url or file_key available")
 
+            # ---------------------------------------------------------
+            # المرحلة الأولى: الدبلجة الصوتية (من sl-dubbing-factory)
+            # ---------------------------------------------------------
             modal_payload = {
                 'media_url': media_url,
                 'lang': lang,
@@ -86,29 +90,57 @@ def process_dub(self, *args, **kwargs):
                 'engine': engine,
             }
 
-            logger.info(f"[job={job_id}] → Modal {MODAL_DUBBING_URL}/upload-from-url")
-
-            r = requests.post(
-                f"{MODAL_DUBBING_URL}/upload-from-url",
-                json=modal_payload,
-                timeout=1500
-            )
+            logger.info(f"[job={job_id}] Phase 1: Audio Dubbing...")
+            r = requests.post(f"{MODAL_DUBBING_URL}/upload-from-url", json=modal_payload, timeout=1500)
 
             if r.status_code != 200:
-                raise Exception(f"Modal HTTP {r.status_code}: {r.text[:300]}")
+                raise Exception(f"Modal Audio Dubbing HTTP {r.status_code}: {r.text[:300]}")
 
             data = r.json()
             if not data.get('success'):
                 raise Exception(data.get('error', 'Modal returned success=false'))
 
-            # ✅ نجح — حفظ بأسماء الحقول الصحيحة
+            dubbed_audio_url = data.get('audio_url')
+            final_output_url = dubbed_audio_url  # كقيمة افتراضية إذا فشلت المرحلة الثانية
+
+            # ---------------------------------------------------------
+            # المرحلة الثانية: مزامنة الشفاه والدمج (من sl-lipsync-factory)
+            # ---------------------------------------------------------
+            if MODAL_LIPSYNC_URL:
+                logger.info(f"[job={job_id}] Phase 2: LipSync & Video Merge...")
+                lipsync_payload = {
+                    "media_url": media_url,
+                    "dubbed_audio_url": dubbed_audio_url,
+                    "auto_lipsync": True,           # الذكاء الاصطناعي يقرر إذا كان يحتاج LipSync أو VoiceOver
+                    "preserve_background": True     # الحفاظ على المؤثرات والموسيقى
+                }
+                
+                try:
+                    ls_r = requests.post(f"{MODAL_LIPSYNC_URL}/dub-video", json=lipsync_payload, timeout=1800)
+                    if ls_r.status_code == 200:
+                        ls_data = ls_r.json()
+                        if ls_data.get('success'):
+                            final_output_url = ls_data.get('output_url')
+                            logger.info(f"[job={job_id}] ✅ Phase 2 Done (Type: {ls_data.get('output_type')})")
+                        else:
+                            logger.warning(f"[job={job_id}] Phase 2 Logic Error: {ls_data.get('error')}. Falling back to Audio.")
+                    else:
+                        logger.warning(f"[job={job_id}] Phase 2 HTTP Error {ls_r.status_code}. Falling back to Audio.")
+                except Exception as ls_e:
+                    logger.warning(f"[job={job_id}] Phase 2 Exception: {ls_e}. Falling back to Audio.")
+            else:
+                logger.info(f"[job={job_id}] MODAL_LIPSYNC_URL is not set. Skipping Phase 2.")
+
+            # ---------------------------------------------------------
+            # حفظ النتيجة النهائية
+            # ---------------------------------------------------------
             job.status = 'completed'
-            job.output_url = data.get('audio_url')
+            job.output_url = final_output_url
             job.engine = data.get('engine_used', engine or 'auto')
             job.completed_at = datetime.utcnow()
             db.session.commit()
 
-            logger.info(f"[job={job_id}] ✅ done")
+            logger.info(f"[job={job_id}] 🎉 All Done!")
 
         except Exception as e:
             logger.exception(f"[job={job_id}] ❌ failed: {e}")
