@@ -1,4 +1,4 @@
-# app.py — V1.9 (Auto-healing DB + Video/Audio toggle support)
+# app.py — V1.9 (Auto-healing DB + Video/Audio toggle support + Auto Recharge)
 import os
 import asyncio
 import logging
@@ -53,13 +53,17 @@ def token_required(f):
             # 2. البحث عن المستخدم في قاعدة البيانات
             user = User.query.filter_by(email=email).first()
             
-            # 3. 💡 [الحل السحري]: الشفاء الذاتي للسيرفر (إنشاء المستخدم تلقائياً إذا فُقد)
+            # 3. 💡 [الحل السحري]: الشفاء الذاتي للسيرفر (إنشاء المستخدم أو شحن رصيده إذا كان صفر)
             if not user:
                 user_id = data.get('sub') # معرف المستخدم الأصلي
                 user = User(id=user_id, email=email, credits=200000) # تعويض الرصيد بـ 200 ألف نقطة
                 db.session.add(user)
                 db.session.commit()
                 print(f"Auto-created missing user: {email}")
+            elif user.credits is None or user.credits <= 0:
+                user.credits = 200000 # إعادة شحن الرصيد فوراً إذا كان صفر
+                db.session.commit()
+                print(f"Auto-recharged existing user: {email}")
                 
             return f(user, *args, **kwargs)
             
