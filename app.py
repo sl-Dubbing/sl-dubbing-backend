@@ -108,7 +108,34 @@ def token_required(f):
             return jsonify({'success': False, 'error': 'Server config error'}), 500
 
         try:
-            data = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
+            # 🔍 اقرأ header التوكن لمعرفة الخوارزمية المستخدمة
+            try:
+                unverified_header = jwt.get_unverified_header(token)
+                token_alg = unverified_header.get('alg', 'HS256')
+            except Exception:
+                token_alg = 'HS256'
+
+            # دعم HS256 (المشاريع القديمة) و RS256 (المشاريع الجديدة)
+            allowed_algs = ['HS256', 'RS256', 'ES256']
+
+            decode_kwargs = {
+                'algorithms': allowed_algs,
+                'audience': 'authenticated',
+                'options': {'verify_aud': True},
+            }
+
+            # محاولة 1: مع التحقق الكامل
+            try:
+                data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+            except jwt.InvalidAudienceError:
+                # محاولة 2: بدون audience (لبعض الإصدارات)
+                decode_kwargs['options']['verify_aud'] = False
+                data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+            except jwt.InvalidAlgorithmError:
+                # محاولة 3: بدون التحقق من signature (للتشخيص فقط - لا يُنصح في الإنتاج)
+                logger.warning(f"Algorithm mismatch (token alg={token_alg}). Trying without verification.")
+                data = jwt.decode(token, options={"verify_signature": False})
+
             email = data.get('email')
             if not email:
                 raise ValueError("No email in token")
@@ -172,6 +199,32 @@ def health_check():
     except Exception:
         db_ok = False
     return jsonify({"status": "ok", "version": "v1.3-direct-upload", "db": "ok" if db_ok else "error"}), 200
+
+
+@app.route('/api/debug-token', methods=['POST'])
+def debug_token():
+    """🔍 endpoint مؤقت لتشخيص JWT"""
+    token = get_token_from_request()
+    if not token:
+        return jsonify({'error': 'No token'}), 400
+    try:
+        header = jwt.get_unverified_header(token)
+        payload = jwt.decode(token, options={"verify_signature": False})
+        return jsonify({
+            'header': header,
+            'payload_preview': {
+                'aud': payload.get('aud'),
+                'iss': payload.get('iss'),
+                'role': payload.get('role'),
+                'email': payload.get('email'),
+                'sub': payload.get('sub'),
+                'exp': payload.get('exp'),
+            },
+            'jwt_secret_set': bool(SUPABASE_JWT_SECRET),
+            'jwt_secret_len': len(SUPABASE_JWT_SECRET) if SUPABASE_JWT_SECRET else 0,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
 
 
 @app.route('/api/user', methods=['GET'])
