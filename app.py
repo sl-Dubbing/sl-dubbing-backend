@@ -1,4 +1,4 @@
-# app.py — V2.1 (Final Security Fix - Multi-Algorithm Support)
+# app.py — V2.2 (Ultimate Fix: CORS Preflight + Multi-Algorithm Support)
 import os
 import asyncio
 import logging
@@ -16,7 +16,9 @@ from tasks import process_smart_tts, process_dub, process_stt
 load_dotenv()
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sl-mega-secret-2026')
-CORS(app, supports_credentials=True, origins="*")
+
+# تحديث إعدادات CORS لتكون أكثر مرونة مع المتصفحات
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
 # إعدادات قاعدة البيانات والـ S3
 DATABASE_URL = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://', 1)
@@ -35,10 +37,14 @@ ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'ogg', '
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# --- Decorators & Helpers (نسخة الحماية القصوى) ---
+# --- Decorator المحدث لحل مشكلة الـ CORS والـ Algorithm ---
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        # 1. حل مشكلة الـ CORS: السماح لطلبات OPTIONS بالمرور دون فحص التوكن
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
+
         auth = request.headers.get('Authorization', '')
         token = auth.split()[1] if 'Bearer ' in auth else request.cookies.get('session')
         
@@ -46,34 +52,32 @@ def token_required(f):
             return jsonify({'error': 'Unauthorized'}), 401
             
         try:
-            # 💡 التعديل الجذري: السماح بجميع الخوارزميات التي قد يستخدمها Supabase (HS256, HS512, RS256)
-            # هذا يحل خطأ "The specified alg value is not allowed" نهائياً
+            # 2. حل مشكلة الـ Algorithm: قبول جميع الخوارزميات الممكنة من Supabase
+            secret = os.environ.get('SUPABASE_JWT_SECRET')
             data = jwt.decode(
                 token, 
-                os.environ.get('SUPABASE_JWT_SECRET'), 
-                algorithms=['HS256', 'HS512', 'HS384', 'RS256'], 
+                secret, 
+                algorithms=['HS256', 'HS384', 'HS512', 'RS256'], 
                 options={'verify_aud': False}
             )
             
-            # الاعتماد على UUID (sub) لضمان ربط الرصيد بشكل دائم وصحيح
             user_id = data.get('sub') 
             email = data.get('email', '')
             
             user = User.query.filter_by(id=user_id).first()
             
-            # إنشاء المستخدم بالرصيد الافتراضي فقط إذا لم يكن له سجل سابق
             if not user:
                 user = User(id=user_id, email=email, credits=200000) 
                 db.session.add(user)
                 db.session.commit()
-                print(f"New user registered securely: {user_id}")
+                print(f"New user registered: {user_id}")
                 
             return f(user, *args, **kwargs)
             
         except Exception as e:
-            # طباعة الخطأ في سجلات Railway لمعرفة السبب في حال حدوث مشاكل مستقبلية
-            print(f"Auth Error: {e}")
-            return jsonify({'error': 'Invalid Session'}), 401
+            # طباعة الخطأ الحقيقي في سجلات Railway
+            print(f"Auth Error: {str(e)}")
+            return jsonify({'error': 'Invalid Session', 'details': str(e)}), 401
             
     return decorated
 
@@ -86,9 +90,10 @@ def deduct_credits(user, amount, job_id):
 
 # --- Endpoints ---
 
-@app.route('/api/upload-url', methods=['POST'])
+@app.route('/api/upload-url', methods=['POST', 'OPTIONS'])
 @token_required
 def get_upload_url(current_user):
+    if request.method == 'OPTIONS': return jsonify({'ok': True})
     data = request.json or {}
     filename = data.get('filename', 'file.mp4')
     if not allowed_file(filename): return jsonify({'error': 'Invalid format'}), 400
@@ -97,13 +102,12 @@ def get_upload_url(current_user):
     url = s3_client.generate_presigned_url('put_object', Params={'Bucket': R2_BUCKET_NAME, 'Key': file_key, 'ContentType': data.get('content_type')}, ExpiresIn=3600)
     return jsonify({'success': True, 'upload_url': url, 'file_key': file_key})
 
-@app.route('/api/dub', methods=['POST'])
+@app.route('/api/dub', methods=['POST', 'OPTIONS'])
 @token_required
 def start_dub(current_user):
+    if request.method == 'OPTIONS': return jsonify({'ok': True})
     data = request.json or {}
     file_key = data.get('file_key')
-    
-    # استلام خيارات الواجهة الجديدة (فيديو/صوت، مزامنة الشفاه، عينة الصوت)
     with_lipsync = data.get('with_lipsync', False) 
     return_video = data.get('return_video', True) 
     sample_b64 = data.get('sample_b64', '')
@@ -120,22 +124,18 @@ def start_dub(current_user):
     db.session.add(new_job)
     db.session.commit()
 
-    # تمرير جميع المعاملات الجديدة لمهمة المعالجة
     process_dub.delay({
-        'job_id': job_id, 
-        'file_key': file_key, 
-        'lang': data.get('lang', 'ar'),
-        'voice_id': data.get('voice_id', 'source'), 
-        'sample_b64': sample_b64,
-        'with_lipsync': with_lipsync,
-        'video_output': return_video,
+        'job_id': job_id, 'file_key': file_key, 'lang': data.get('lang', 'ar'),
+        'voice_id': data.get('voice_id', 'source'), 'sample_b64': sample_b64,
+        'with_lipsync': with_lipsync, 'video_output': return_video,
         'engine': data.get('engine', '')
     })
     return jsonify({'success': True, 'job_id': job_id}), 202
 
-@app.route('/api/job/<job_id>', methods=['GET'])
+@app.route('/api/job/<job_id>', methods=['GET', 'OPTIONS'])
 @token_required
 def check_job(current_user, job_id):
+    if request.method == 'OPTIONS': return jsonify({'ok': True})
     job = DubbingJob.query.get(job_id)
     if not job or job.user_id != current_user.id: return jsonify({'error': 'Not found'}), 404
     return jsonify({'status': job.status, 'output_url': job.output_url, 'error': job.error_message})
