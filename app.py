@@ -648,8 +648,20 @@ def migrate_db():
         return jsonify({'error': str(e)}), 500
 
 
+# ==========================================
+# 🚀 Initialize DB on import (يعمل مع Gunicorn)
+# ==========================================
+def init_db():
+    try:
+        with app.app_context():
+            db.create_all()
+            logger.info("✅ Database tables created/verified")
+    except Exception as e:
+        logger.exception(f"❌ DB init failed: {e}")
+
+init_db()
+
+
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
