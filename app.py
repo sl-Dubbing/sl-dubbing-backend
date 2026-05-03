@@ -567,6 +567,29 @@ def logout():
     return jsonify({'success': True})
 
 
+# ==========================================
+# 🛠️ Migration endpoint (مؤقت — احذفه بعد الاستخدام!)
+# ==========================================
+@app.route('/api/admin/migrate-db', methods=['POST'])
+def migrate_db():
+    """⚠️ مؤقت: يحذف ويعيد إنشاء الجداول"""
+    secret = request.headers.get('X-Admin-Secret', '')
+    if secret != os.environ.get('ADMIN_SECRET', 'change-me-to-secret-2026'):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        with app.app_context():
+            db.session.execute("DROP TABLE IF EXISTS credit_transactions CASCADE")
+            db.session.execute("DROP TABLE IF EXISTS dubbing_jobs CASCADE")
+            db.session.execute("DROP TABLE IF EXISTS users CASCADE")
+            db.session.commit()
+            db.create_all()
+        return jsonify({'success': True, 'message': 'DB migrated'})
+    except Exception as e:
+        logger.exception("Migration failed")
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
