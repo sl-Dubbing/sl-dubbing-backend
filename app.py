@@ -1,4 +1,4 @@
-# app.py — V1.4 (Fixed transaction conflict)
+# app.py — V1.5 (Fixed Arabic Filenames & Transaction conflict)
 import os
 import asyncio
 import logging
@@ -9,7 +9,6 @@ import jwt
 import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -155,7 +154,7 @@ def token_required(f):
 
 
 # ==========================================
-# 💳 خصم الرصيد - مبسّط (بدون SELECT FOR UPDATE معقّد)
+# 💳 خصم الرصيد - مبسّط
 # ==========================================
 def deduct_credits(user_id, amount, job_id=None):
     """
@@ -212,7 +211,7 @@ def health_check():
         db.session.execute("SELECT 1")
     except Exception:
         db_ok = False
-    return jsonify({"status": "ok", "version": "v1.4", "db": "ok" if db_ok else "error"}), 200
+    return jsonify({"status": "ok", "version": "v1.5-arabic-names-fixed", "db": "ok" if db_ok else "error"}), 200
 
 
 @app.route('/api/user', methods=['GET'])
@@ -240,11 +239,13 @@ def get_credits(current_user):
 @json_required
 def get_upload_url(current_user):
     data = request.json or {}
-    filename = secure_filename(data.get('filename', 'file'))
+    
+    # ✅ الإصلاح هنا: قمنا بإلغاء secure_filename التي كانت تحذف الأسماء العربية
+    raw_filename = data.get('filename', 'file.bin')
     content_type = data.get('content_type', 'application/octet-stream')
     size = int(data.get('size', 0))
 
-    if not allowed_file(filename):
+    if not allowed_file(raw_filename):
         return jsonify({'error': 'Unsupported file type'}), 400
 
     max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -254,7 +255,8 @@ def get_upload_url(current_user):
     if (current_user.credits or 0) < 1:
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    ext = filename.rsplit('.', 1)[-1] if '.' in filename else 'bin'
+    # استخراج الامتداد بشكل آمن لتجنب مشاكل الأسماء العربية
+    ext = raw_filename.rsplit('.', 1)[-1].lower() if '.' in raw_filename else 'bin'
     file_key = f"uploads/u{current_user.id}/{uuid.uuid4().hex}.{ext}"
 
     try:
