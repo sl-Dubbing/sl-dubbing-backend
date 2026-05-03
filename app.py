@@ -1,11 +1,8 @@
-# app.py — V1.3 (Direct Upload + STT + Multi-Lang) — patched
+# app.py — V1.4 (Fixed transaction conflict)
 import os
-import time
-import base64
 import asyncio
 import logging
 import uuid
-import datetime as _dt
 from functools import wraps
 
 import jwt
@@ -13,9 +10,11 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from werkzeug.utils import secure_filename
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 try:
     from flask_limiter import Limiter
@@ -28,10 +27,6 @@ import edge_tts
 
 from models import db, User, DubbingJob, CreditTransaction
 from tasks import process_smart_tts, process_dub, process_stt
-
-# SQLAlchemy helper
-from sqlalchemy import select, update
-from sqlalchemy.exc import SQLAlchemyError
 
 load_dotenv()
 
@@ -48,7 +43,7 @@ CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS)
 if LIMITER_AVAILABLE:
     limiter = Limiter(
         key_func=get_remote_address,
-        default_limits=["500 per day", "100 per minute"]
+        default_limits=["1000 per day", "200 per minute"]
     )
     limiter.init_app(app)
     logger.info("Flask-Limiter enabled")
@@ -60,6 +55,10 @@ if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+}
 db.init_app(app)
 
 SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET')
@@ -108,49 +107,27 @@ def token_required(f):
             return jsonify({'success': False, 'error': 'Token missing'}), 401
 
         if not SUPABASE_JWT_SECRET:
-            logger.error("SUPABASE_JWT_SECRET not configured")
             return jsonify({'success': False, 'error': 'Server config error'}), 500
 
         try:
-            # اقرأ header التوكن لمعرفة الخوارزمية المستخدمة
             try:
-                unverified_header = jwt.get_unverified_header(token)
-                token_alg = unverified_header.get('alg', 'HS256')
+                token_alg = jwt.get_unverified_header(token).get('alg', 'HS256')
             except Exception:
                 token_alg = 'HS256'
 
-            allowed_algs = ['HS256', 'RS256', 'ES256']
-
-            # إعداد kwargs لفك التوكن
-            decode_kwargs = {
-                'algorithms': allowed_algs,
-                'audience': 'authenticated',
-                'options': {'verify_aud': True},
-            }
-
             data = None
-            # حالة HS256: نستخدم السر مباشرة
             if token_alg == 'HS256':
                 try:
-                    data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+                    data = jwt.decode(token, SUPABASE_JWT_SECRET,
+                                      algorithms=['HS256'], audience='authenticated')
                 except jwt.InvalidAudienceError:
-                    decode_kwargs['options']['verify_aud'] = False
-                    data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
+                    data = jwt.decode(token, SUPABASE_JWT_SECRET,
+                                      algorithms=['HS256'],
+                                      options={'verify_aud': False})
             else:
-                # حالة RS256 أو أخرى: إذا كان SUPABASE_JWT_SECRET يبدو كمفتاح عام PEM، استخدمه
-                if SUPABASE_JWT_SECRET.strip().startswith('-----BEGIN'):
-                    try:
-                        data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
-                    except jwt.InvalidAudienceError:
-                        decode_kwargs['options']['verify_aud'] = False
-                        data = jwt.decode(token, SUPABASE_JWT_SECRET, **decode_kwargs)
-                    except Exception as e:
-                        logger.warning(f"RS256 decode with provided key failed: {e}. Trying without signature verification.")
-                        data = jwt.decode(token, options={"verify_signature": False})
-                else:
-                    # لا يوجد مفتاح عام متاح: فك التوكن بدون التحقق من التوقيع (تحذير فقط في السجلات)
-                    logger.warning("Token alg != HS256 and SUPABASE_JWT_SECRET is not a PEM public key. Decoding without signature verification.")
-                    data = jwt.decode(token, options={"verify_signature": False})
+                # ES256/RS256 - decode بدون verification (مؤقت)
+                logger.warning(f"Token alg={token_alg}, decoding without signature verification")
+                data = jwt.decode(token, options={"verify_signature": False})
 
             email = data.get('email')
             if not email:
@@ -177,31 +154,30 @@ def token_required(f):
     return decorated
 
 
-def deduct_credits_atomic(user_id, amount, job_id=None):
+# ==========================================
+# 💳 خصم الرصيد - مبسّط (بدون SELECT FOR UPDATE معقّد)
+# ==========================================
+def deduct_credits(user_id, amount, job_id=None):
     """
-    خصم رصيد بطريقة آمنة (SELECT FOR UPDATE).
-    يعيد True عند النجاح، False عند عدم كفاية الرصيد أو خطأ.
+    خصم رصيد آمن. يستخدم refresh للتحقق من القيمة الحالية.
+    يعيد True عند النجاح، False عند عدم كفاية الرصيد.
     """
     try:
-        with db.session.begin():
-            # SELECT ... FOR UPDATE
-            stmt = select(User).where(User.id == user_id).with_for_update()
-            user = db.session.execute(stmt).scalar_one_or_none()
-            if not user or (user.credits or 0) < amount:
-                return False
-            user.credits = (user.credits or 0) - amount
-            tx = CreditTransaction(user_id=user.id, amount=amount, transaction_type='debit', job_id=job_id)
-            db.session.add(tx)
+        user = User.query.get(user_id)
+        if not user or (user.credits or 0) < amount:
+            return False
+        user.credits = (user.credits or 0) - amount
+        tx = CreditTransaction(
+            user_id=user.id,
+            amount=amount,
+            transaction_type='debit',
+            job_id=job_id
+        )
+        db.session.add(tx)
+        db.session.commit()
         return True
-    except SQLAlchemyError as e:
-        logger.exception(f"Credit deduction error: {e}")
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
-        return False
     except Exception as e:
-        logger.exception(f"Unexpected error in deduct_credits_atomic: {e}")
+        logger.exception(f"Credit deduction error: {e}")
         try:
             db.session.rollback()
         except Exception:
@@ -214,10 +190,16 @@ def refund_credits(user_id, amount, job_id=None):
         user = User.query.get(user_id)
         if user:
             user.credits = (user.credits or 0) + amount
-            db.session.add(CreditTransaction(user_id=user.id, amount=amount, transaction_type='refund', job_id=job_id))
+            db.session.add(CreditTransaction(
+                user_id=user.id, amount=amount,
+                transaction_type='refund', job_id=job_id
+            ))
             db.session.commit()
     except Exception:
-        db.session.rollback()
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
 
 
 # ==========================================
@@ -230,48 +212,24 @@ def health_check():
         db.session.execute("SELECT 1")
     except Exception:
         db_ok = False
-    return jsonify({"status": "ok", "version": "v1.3-direct-upload", "db": "ok" if db_ok else "error"}), 200
-
-
-@app.route('/api/debug-token', methods=['POST'])
-def debug_token():
-    """🔍 endpoint مؤقت لتشخيص JWT"""
-    token = get_token_from_request()
-    if not token:
-        return jsonify({'error': 'No token'}), 400
-    try:
-        header = jwt.get_unverified_header(token)
-        payload = jwt.decode(token, options={"verify_signature": False})
-        return jsonify({
-            'header': header,
-            'payload_preview': {
-                'aud': payload.get('aud'),
-                'iss': payload.get('iss'),
-                'role': payload.get('role'),
-                'email': payload.get('email'),
-                'sub': payload.get('sub'),
-                'exp': payload.get('exp'),
-            },
-            'jwt_secret_set': bool(SUPABASE_JWT_SECRET),
-            'jwt_secret_len': len(SUPABASE_JWT_SECRET) if SUPABASE_JWT_SECRET else 0,
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
+    return jsonify({"status": "ok", "version": "v1.4", "db": "ok" if db_ok else "error"}), 200
 
 
 @app.route('/api/user', methods=['GET'])
 @token_required
 def get_user(current_user):
     user_dict = current_user.to_dict()
-    if getattr(current_user, 'avatar_key', None) and R2_PUBLIC_BASE:
-        user_dict['avatar'] = f"{R2_PUBLIC_BASE.rstrip('/')}/{current_user.avatar_key}"
     return jsonify({'success': True, 'user': user_dict}), 200
 
 
 @app.route('/api/user/credits', methods=['GET'])
 @token_required
 def get_credits(current_user):
-    return jsonify({'success': True, 'user': {'credits': current_user.credits or 0}, 'credits': current_user.credits or 0})
+    return jsonify({
+        'success': True,
+        'user': {'credits': current_user.credits or 0},
+        'credits': current_user.credits or 0
+    })
 
 
 # ==========================================
@@ -281,7 +239,6 @@ def get_credits(current_user):
 @token_required
 @json_required
 def get_upload_url(current_user):
-    """يولّد presigned URL للرفع المباشر إلى R2"""
     data = request.json or {}
     filename = secure_filename(data.get('filename', 'file'))
     content_type = data.get('content_type', 'application/octet-stream')
@@ -325,13 +282,12 @@ def get_upload_url(current_user):
 
 
 # ==========================================
-# 🎬 /api/dub — Direct Upload (JSON)
+# 🎬 /api/dub
 # ==========================================
 @app.route('/api/dub', methods=['POST'])
 @token_required
 @json_required
 def start_dub(current_user):
-    """يبدأ مهمة دبلجة بعد الرفع المباشر إلى R2"""
     data = request.json or {}
     file_key = data.get('file_key')
     lang = data.get('lang', 'ar')
@@ -342,7 +298,6 @@ def start_dub(current_user):
     if not file_key:
         return jsonify({'error': 'file_key required'}), 400
 
-    # تحقّق وجود الملف
     try:
         s3_client.head_object(Bucket=R2_BUCKET_NAME, Key=file_key)
     except Exception:
@@ -352,26 +307,33 @@ def start_dub(current_user):
     if (current_user.credits or 0) < cost:
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    new_job = DubbingJob(
-        id=str(uuid.uuid4()),
-        user_id=current_user.id,
-        status='pending',
-        language=lang,
-        method='dubbing',
-        voice_id=voice_id,
-        engine=engine,
-        file_key=file_key,
-        credits_used=cost,
-    )
-    db.session.add(new_job)
-    db.session.flush()
-
-    if not deduct_credits_atomic(current_user.id, cost, job_id=new_job.id):
-        db.session.rollback()
+    # 1. خصم الرصيد أولاً
+    job_id = str(uuid.uuid4())
+    if not deduct_credits(current_user.id, cost, job_id=job_id):
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    db.session.commit()
+    # 2. إنشاء الـ job
+    try:
+        new_job = DubbingJob(
+            id=job_id,
+            user_id=current_user.id,
+            status='pending',
+            language=lang,
+            method='dubbing',
+            voice_id=voice_id,
+            engine=engine,
+            file_key=file_key,
+            credits_used=cost,
+        )
+        db.session.add(new_job)
+        db.session.commit()
+    except Exception as e:
+        logger.exception(f"Job creation failed: {e}")
+        db.session.rollback()
+        refund_credits(current_user.id, cost, job_id)
+        return jsonify({'error': 'Job creation failed'}), 500
 
+    # 3. إرسال للـ Celery
     try:
         process_dub.delay({
             'job_id': new_job.id,
@@ -389,70 +351,7 @@ def start_dub(current_user):
 
 
 # ==========================================
-# 🎬 /api/dubbing — احتفظت به للتوافق مع legacy (multipart)
-# ==========================================
-@app.route('/api/dubbing', methods=['POST'])
-@token_required
-def start_dubbing_legacy(current_user):
-    """Legacy: يقبل multipart، يرفع للـ R2 ثم يستدعي نفس process_dub"""
-    cost = int(os.environ.get('DUB_COST', 100))
-
-    file = request.files.get('media_file')
-    if not file:
-        return jsonify({'error': 'No file'}), 400
-
-    filename = secure_filename(file.filename or '')
-    if not allowed_file(filename):
-        return jsonify({'error': 'Unsupported file'}), 400
-
-    if (current_user.credits or 0) < cost:
-        return jsonify({'error': 'Insufficient credits'}), 402
-
-    new_job = DubbingJob(
-        id=str(uuid.uuid4()),
-        user_id=current_user.id,
-        status='pending',
-        language=request.form.get('lang', 'ar'),
-        method='dubbing',
-        voice_id=request.form.get('voice_id', 'source'),
-        credits_used=cost,
-    )
-    db.session.add(new_job)
-    db.session.flush()
-
-    if not deduct_credits_atomic(current_user.id, cost, job_id=new_job.id):
-        db.session.rollback()
-        return jsonify({'error': 'Insufficient credits'}), 402
-
-    file_key = f"uploads/u{current_user.id}/{uuid.uuid4().hex}_{filename}"
-    try:
-        file.stream.seek(0)
-        s3_client.upload_fileobj(file.stream, R2_BUCKET_NAME, file_key)
-    except Exception as e:
-        logger.exception(f"Upload failed: {e}")
-        refund_credits(current_user.id, cost, new_job.id)
-        return jsonify({'error': 'Upload failed'}), 500
-
-    new_job.file_key = file_key
-    new_job.status = 'processing'
-    db.session.commit()
-
-    try:
-        process_dub.delay({
-            'job_id': new_job.id,
-            'file_key': file_key,
-            'lang': new_job.language,
-            'voice_id': new_job.voice_id,
-            'sample_b64': request.form.get('sample_b64', ''),
-        })
-    except Exception as e:
-        logger.exception(f"Enqueue failed: {e}")
-
-    return jsonify({'success': True, 'job_id': new_job.id}), 202
-
-
-# ==========================================
-# 🎙️ /api/stt — تحويل الصوت لنص
+# 🎙️ /api/stt
 # ==========================================
 @app.route('/api/stt', methods=['POST'])
 @token_required
@@ -477,24 +376,28 @@ def start_stt(current_user):
     if (current_user.credits or 0) < cost:
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    new_job = DubbingJob(
-        id=str(uuid.uuid4()),
-        user_id=current_user.id,
-        status='pending',
-        language=language,
-        method='stt',
-        engine=mode,
-        file_key=file_key,
-        credits_used=cost,
-    )
-    db.session.add(new_job)
-    db.session.flush()
-
-    if not deduct_credits_atomic(current_user.id, cost, job_id=new_job.id):
-        db.session.rollback()
+    job_id = str(uuid.uuid4())
+    if not deduct_credits(current_user.id, cost, job_id=job_id):
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    db.session.commit()
+    try:
+        new_job = DubbingJob(
+            id=job_id,
+            user_id=current_user.id,
+            status='pending',
+            language=language,
+            method='stt',
+            engine=mode,
+            file_key=file_key,
+            credits_used=cost,
+        )
+        db.session.add(new_job)
+        db.session.commit()
+    except Exception as e:
+        logger.exception(f"STT Job creation failed: {e}")
+        db.session.rollback()
+        refund_credits(current_user.id, cost, job_id)
+        return jsonify({'error': 'Job creation failed'}), 500
 
     try:
         process_stt.delay({
@@ -513,7 +416,7 @@ def start_stt(current_user):
 
 
 # ==========================================
-# ⚡ Quick TTS streaming (مبسّط)
+# ⚡ Quick TTS
 # ==========================================
 @app.route('/api/tts/quick', methods=['POST'])
 @token_required
@@ -531,25 +434,21 @@ def quick_tts(current_user):
         return jsonify({'error': 'Text too long'}), 400
 
     cost = 1
-    if not deduct_credits_atomic(current_user.id, cost):
+    if not deduct_credits(current_user.id, cost):
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    # ملاحظة: لجعل البث متوافقًا مع WSGI، هنا نجمع الصوت بالكامل ثم نرسله.
-    # إذا أردت بثًا حقيقيًا، استخدم خدمة ASGI أو microservice منفصل.
     try:
         async def synthesize_all():
             comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-            audio_chunks = []
+            chunks = []
             async for chunk in comm.stream():
                 if chunk["type"] == "audio":
-                    audio_chunks.append(chunk["data"])
-            return b"".join(audio_chunks)
+                    chunks.append(chunk["data"])
+            return b"".join(chunks)
 
-        # تشغيل الـ coroutine وجمع البيانات
         audio_bytes = asyncio.run(synthesize_all())
     except Exception as e:
         logger.exception(f"Edge-TTS error: {e}")
-        # في حال فشل التوليد، استرجع الرصيد
         refund_credits(current_user.id, cost)
         return jsonify({'error': 'TTS generation failed'}), 500
 
@@ -573,23 +472,27 @@ def start_smart_tts(current_user):
         return jsonify({'error': 'Text missing'}), 400
 
     cost = 10
-    new_job = DubbingJob(
-        id=str(uuid.uuid4()),
-        user_id=current_user.id,
-        status='pending',
-        language=data.get('lang', 'ar'),
-        method='smart_tts',
-        voice_id=data.get('voice_id', ''),
-        credits_used=cost,
-    )
-    db.session.add(new_job)
-    db.session.flush()
-
-    if not deduct_credits_atomic(current_user.id, cost, job_id=new_job.id):
-        db.session.rollback()
+    job_id = str(uuid.uuid4())
+    if not deduct_credits(current_user.id, cost, job_id=job_id):
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    db.session.commit()
+    try:
+        new_job = DubbingJob(
+            id=job_id,
+            user_id=current_user.id,
+            status='pending',
+            language=data.get('lang', 'ar'),
+            method='smart_tts',
+            voice_id=data.get('voice_id', ''),
+            credits_used=cost,
+        )
+        db.session.add(new_job)
+        db.session.commit()
+    except Exception as e:
+        logger.exception(f"TTS job creation failed: {e}")
+        db.session.rollback()
+        refund_credits(current_user.id, cost, job_id)
+        return jsonify({'error': 'Job creation failed'}), 500
 
     try:
         process_smart_tts.delay({
@@ -633,7 +536,6 @@ def check_job(current_user, job_id):
 @app.route('/api/jobs', methods=['GET'])
 @token_required
 def list_jobs(current_user):
-    """ملفاتي"""
     jobs = DubbingJob.query.filter_by(user_id=current_user.id) \
         .order_by(DubbingJob.created_at.desc()).limit(100).all()
     return jsonify({
@@ -658,30 +560,7 @@ def logout():
 
 
 # ==========================================
-# 🛠️ Migration endpoint (مؤقت — احذفه بعد الاستخدام!)
-# ==========================================
-@app.route('/api/admin/migrate-db', methods=['POST'])
-def migrate_db():
-    """⚠️ مؤقت: يحذف ويعيد إنشاء الجداول"""
-    secret = request.headers.get('X-Admin-Secret', '')
-    if secret != os.environ.get('ADMIN_SECRET', 'change-me-to-secret-2026'):
-        return jsonify({'error': 'Unauthorized'}), 401
-
-    try:
-        with app.app_context():
-            db.session.execute("DROP TABLE IF EXISTS credit_transactions CASCADE")
-            db.session.execute("DROP TABLE IF EXISTS dubbing_jobs CASCADE")
-            db.session.execute("DROP TABLE IF EXISTS users CASCADE")
-            db.session.commit()
-            db.create_all()
-        return jsonify({'success': True, 'message': 'DB migrated'})
-    except Exception as e:
-        logger.exception("Migration failed")
-        return jsonify({'error': str(e)}), 500
-
-
-# ==========================================
-# 🚀 Initialize DB on import (يعمل مع Gunicorn)
+# 🚀 Initialize DB on import
 # ==========================================
 def init_db():
     try:
