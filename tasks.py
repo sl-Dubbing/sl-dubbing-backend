@@ -1,30 +1,119 @@
-# tasks.py — V6.5 (UUID Compatible + Sync Fix)
+# tasks.py — V5.0 (متوافق مع app.py + models.py)
 import os
 import logging
+import tempfile
+import subprocess
+import uuid
 from datetime import datetime
 from celery import Celery
 import requests
 
 logger = logging.getLogger("sl-tasks")
 
-# تأكد من ربط Redis بشكل صحيح من متغيرات Railway
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
 celery_app = Celery('sl_dubbing', broker=REDIS_URL, backend=REDIS_URL)
-
 celery_app.conf.update(
     task_serializer='json',
     accept_content=['json'],
     result_serializer='json',
     task_track_started=True,
-    task_time_limit=2500, 
-    task_soft_time_limit=2400,
+    task_time_limit=1800,
+    task_soft_time_limit=1500,
 )
 
-# جلب الروابط من متغيرات البيئة
 MODAL_DUBBING_URL = os.environ.get('MODAL_DUBBING_URL')
-MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')
+MODAL_TTS_URL = os.environ.get('MODAL_TTS_URL')
+MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
+MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
+MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')  # Smart Video Dubber
+
+
+def _merge_video_audio_locally(media_url, dubbed_audio_url):
+    """
+    🎬 دمج فيديو + صوت مدبلج محلياً (بدون Modal)
+    سريع جداً (~10 ثوان لفيديو دقيقة) ولا يحتاج GPU.
+    """
+    import boto3
+    from botocore.client import Config
+    import shutil
+
+    # تحقّق من ffmpeg
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5, check=True)
+    except Exception:
+        logger.error("ffmpeg not available in worker")
+        return None
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        # 1. تحميل الفيديو الأصلي
+        video_path = os.path.join(temp_dir, "video.mp4")
+        with requests.get(media_url, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            with open(video_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+
+        # 2. تحميل الصوت المدبلج
+        audio_path = os.path.join(temp_dir, "dubbed.wav")
+        with requests.get(dubbed_audio_url, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            with open(audio_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+
+        # 3. دمج
+        output_path = os.path.join(temp_dir, "output.mp4")
+        result = subprocess.run([
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest",
+            output_path
+        ], capture_output=True, timeout=300)
+
+        if result.returncode != 0:
+            logger.error(f"ffmpeg failed: {result.stderr.decode()[:500]}")
+            return None
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
+            return None
+
+        # 4. ارفع لـ R2
+        s3 = boto3.client(
+            's3',
+            endpoint_url=os.environ.get('R2_ENDPOINT_URL'),
+            aws_access_key_id=os.environ.get('R2_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
+            config=Config(signature_version='s3v4'),
+            region_name='auto'
+        )
+        bucket = os.environ.get('R2_BUCKET_NAME')
+
+        out_key = f"results/dub_video_{uuid.uuid4().hex}.mp4"
+        s3.upload_file(output_path, bucket, out_key)
+
+        url = s3.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket, 'Key': out_key},
+            ExpiresIn=604800
+        )
+        return url
+
+    except Exception as e:
+        logger.exception(f"Local merge failed: {e}")
+        return None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 def _build_presigned_url(file_key, expires=7200):
+    """يولّد رابط مؤقت من R2"""
     import boto3
     from botocore.client import Config
     s3 = boto3.client(
@@ -36,8 +125,16 @@ def _build_presigned_url(file_key, expires=7200):
         region_name='auto'
     )
     bucket = os.environ.get('R2_BUCKET_NAME')
-    return s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': file_key}, ExpiresIn=expires)
+    return s3.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': bucket, 'Key': file_key},
+        ExpiresIn=expires
+    )
 
+
+# ==========================================
+# 🎬 process_dub — للدبلجة
+# ==========================================
 @celery_app.task(bind=True, max_retries=2)
 def process_dub(self, *args, **kwargs):
     from app import app, db
@@ -48,15 +145,205 @@ def process_dub(self, *args, **kwargs):
     file_key = payload.get('file_key')
     media_url = payload.get('media_url')
     lang = payload.get('lang', 'ar')
-    
-    with_lipsync = payload.get('with_lipsync', False)
-    video_output = payload.get('video_output', True)
-    
+    voice_id = payload.get('voice_id', 'source')
+    sample_b64 = payload.get('sample_b64', '')
+    engine = payload.get('engine', '')
+    with_lipsync = bool(payload.get('with_lipsync', False))
+    video_output = bool(payload.get('video_output', True))
+
     with app.app_context():
-        # البحث عن المهمة (المعرف الآن نصي UUID)
         job = DubbingJob.query.get(job_id)
-        if not job: 
-            logger.error(f"Job {job_id} not found in database.")
+        if not job:
+            logger.error(f"Job {job_id} not found")
+            return
+
+        try:
+            job.status = 'processing'
+            db.session.commit()
+
+            # توليد URL إذا لم يصلنا
+            if not media_url and (file_key or job.file_key):
+                media_url = _build_presigned_url(file_key or job.file_key)
+
+            if not media_url:
+                raise Exception("No media_url or file_key available")
+
+            modal_payload = {
+                'media_url': media_url,
+                'lang': lang,
+                'voice_id': voice_id,
+                'sample_b64': sample_b64,
+                'engine': engine,
+            }
+
+            logger.info(f"[job={job_id}] → Modal {MODAL_DUBBING_URL}/upload-from-url")
+
+            r = requests.post(
+                f"{MODAL_DUBBING_URL}/upload-from-url",
+                json=modal_payload,
+                timeout=1500
+            )
+
+            if r.status_code != 200:
+                raise Exception(f"Modal HTTP {r.status_code}: {r.text[:300]}")
+
+            data = r.json()
+            if not data.get('success'):
+                raise Exception(data.get('error', 'Modal returned success=false'))
+
+            audio_url = data.get('audio_url')
+            final_url = audio_url
+            output_type = "audio"
+
+            # ===========================================
+            # 🎬 VIDEO OUTPUT - منطق ذكي
+            # ===========================================
+            file_ext = (file_key or '').rsplit('.', 1)[-1].lower() if file_key else ''
+            video_exts = {'mp4', 'mov', 'mkv', 'webm', 'avi', 'mpg', 'mpeg', 'm4v'}
+            is_video = file_ext in video_exts
+
+            if is_video and video_output and media_url:
+                # Path 1: مع lip sync → استخدم Modal (LatentSync)
+                if with_lipsync and MODAL_LIPSYNC_URL:
+                    try:
+                        logger.info(f"[job={job_id}] 🎬 → LatentSync (Modal)")
+                        smart_url = f"{MODAL_LIPSYNC_URL.rstrip('/')}/dub-video"
+                        smart_resp = requests.post(smart_url, json={
+                            'media_url': media_url,
+                            'dubbed_audio_url': audio_url,
+                            'preserve_background': True,
+                            'auto_lipsync': True,
+                            'force_lipsync': True,
+                        }, timeout=1500)
+
+                        if smart_resp.status_code == 200:
+                            smart_data = smart_resp.json()
+                            if smart_data.get('success'):
+                                final_url = smart_data.get('output_url', audio_url)
+                                output_type = smart_data.get('output_type', 'audio')
+                                logger.info(f"[job={job_id}] ✅ LipSync done")
+                    except Exception as e:
+                        logger.warning(f"[job={job_id}] LipSync failed: {e}")
+
+                # Path 2: بدون lip sync → دمج محلي بـ ffmpeg (سريع جداً!)
+                else:
+                    logger.info(f"[job={job_id}] 🎬 → Local ffmpeg merge")
+                    merged_url = _merge_video_audio_locally(media_url, audio_url)
+                    if merged_url:
+                        final_url = merged_url
+                        output_type = "video"
+                        logger.info(f"[job={job_id}] ✅ Video merged locally")
+                    else:
+                        logger.warning(f"[job={job_id}] Local merge failed, using audio")
+
+            # ✅ نجح
+            job.status = 'completed'
+            job.output_url = final_url
+            job.engine = data.get('engine_used', engine or 'auto')
+            job.completed_at = datetime.utcnow()
+            db.session.commit()
+
+            logger.info(f"[job={job_id}] ✅ done ({output_type})")
+
+        except Exception as e:
+            logger.exception(f"[job={job_id}] ❌ failed: {e}")
+            try:
+                job.status = 'failed'
+                job.error_message = str(e)[:500]
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            try:
+                self.retry(exc=e, countdown=10)
+            except Exception:
+                pass
+
+
+# ==========================================
+# 🎙️ process_smart_tts — للـ TTS الذكي
+# ==========================================
+@celery_app.task(bind=True, max_retries=2)
+def process_smart_tts(self, *args, **kwargs):
+    from app import app, db
+    from models import DubbingJob
+
+    payload = args[0] if args and isinstance(args[0], dict) else kwargs
+    job_id = payload.get('job_id')
+    text = payload.get('text', '')
+    lang = payload.get('lang', 'ar')
+    sample_b64 = payload.get('sample_b64', '')
+    voice_id = payload.get('voice_id', '')
+    rate = payload.get('rate', '+0%')
+    pitch = payload.get('pitch', '+0Hz')
+
+    with app.app_context():
+        job = DubbingJob.query.get(job_id)
+        if not job:
+            logger.error(f"TTS Job {job_id} not found")
+            return
+
+        try:
+            job.status = 'processing'
+            db.session.commit()
+
+            endpoint = '/cloned' if (sample_b64 or voice_id) else '/fast'
+            modal_payload = {
+                'text': text, 'lang': lang,
+                'sample_b64': sample_b64, 'voice_id': voice_id,
+                'rate': rate, 'pitch': pitch,
+            }
+
+            logger.info(f"[tts={job_id}] → Modal {MODAL_TTS_URL}{endpoint}")
+
+            r = requests.post(f"{MODAL_TTS_URL}{endpoint}", json=modal_payload, timeout=600)
+            if r.status_code != 200:
+                raise Exception(f"Modal HTTP {r.status_code}: {r.text[:300]}")
+
+            data = r.json()
+            if not data.get('success'):
+                raise Exception(data.get('error', 'Modal returned success=false'))
+
+            job.status = 'completed'
+            job.output_url = data.get('audio_url')
+            job.completed_at = datetime.utcnow()
+            db.session.commit()
+            logger.info(f"[tts={job_id}] ✅ done")
+
+        except Exception as e:
+            logger.exception(f"[tts={job_id}] ❌ failed: {e}")
+            try:
+                job.status = 'failed'
+                job.error_message = str(e)[:500]
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            try:
+                self.retry(exc=e, countdown=10)
+            except Exception:
+                pass
+
+
+# ==========================================
+# 🎙️ process_stt — تحويل الصوت لنص
+# ==========================================
+@celery_app.task(bind=True, max_retries=2)
+def process_stt(self, *args, **kwargs):
+    from app import app, db
+    from models import DubbingJob
+
+    payload = args[0] if args and isinstance(args[0], dict) else kwargs
+    job_id = payload.get('job_id')
+    media_url = payload.get('media_url')
+    file_key = payload.get('file_key')
+    language = payload.get('language', 'auto')
+    mode = payload.get('mode', 'fast')
+    diarize = payload.get('diarize', False)
+    translate = payload.get('translate', False)
+
+    with app.app_context():
+        job = DubbingJob.query.get(job_id)
+        if not job:
+            logger.error(f"STT Job {job_id} not found")
             return
 
         try:
@@ -66,45 +353,50 @@ def process_dub(self, *args, **kwargs):
             if not media_url and (file_key or job.file_key):
                 media_url = _build_presigned_url(file_key or job.file_key)
 
-            if not media_url: raise Exception("No media_url available")
+            if not media_url:
+                raise Exception("No media_url or file_key")
 
-            # المرحلة 1: الدبلجة الصوتية
+            base_url = MODAL_STT_PRECISE_URL if mode == 'precise' else MODAL_STT_URL
+            endpoint = '/transcribe-precise' if mode == 'precise' else '/transcribe-from-url'
+
             modal_payload = {
-                'media_url': media_url, 'lang': lang,
-                'voice_id': payload.get('voice_id', 'source'),
-                'sample_b64': payload.get('sample_b64', ''),
-                'engine': payload.get('engine', 'f5tts'),
+                'media_url': media_url,
+                'language': language if language != 'auto' else None,
+                'translate': translate,
+                'diarize': diarize,
+                'format': 'all',
             }
-            
-            r = requests.post(f"{MODAL_DUBBING_URL}/upload-from-url", json=modal_payload, timeout=1500)
-            if r.status_code != 200: raise Exception(f"Dubbing HTTP {r.status_code}")
-            data = r.json()
-            
-            dubbed_audio_url = data.get('audio_url')
-            final_output_url = dubbed_audio_url
 
-            # المرحلة 2: معالجة الفيديو (LipSync)
-            if video_output and MODAL_LIPSYNC_URL:
-                lipsync_payload = {
-                    "media_url": media_url,
-                    "dubbed_audio_url": dubbed_audio_url,
-                    "preserve_background": True,
-                    "auto_lipsync": False, 
-                    "force_lipsync": with_lipsync 
-                }
-                ls_r = requests.post(f"{MODAL_LIPSYNC_URL}/dub-video", json=lipsync_payload, timeout=1800)
-                if ls_r.status_code == 200:
-                    ls_data = ls_r.json()
-                    if ls_data.get('success'):
-                        final_output_url = ls_data.get('output_url')
+            logger.info(f"[stt={job_id}] → Modal {base_url}{endpoint}")
+
+            r = requests.post(f"{base_url}{endpoint}", json=modal_payload, timeout=900)
+            if r.status_code != 200:
+                raise Exception(f"Modal HTTP {r.status_code}: {r.text[:300]}")
+
+            data = r.json()
+            if not data.get('success'):
+                raise Exception(data.get('error', 'Unknown'))
 
             job.status = 'completed'
-            job.output_url = final_output_url
+            job.output_url = data.get('json_url') or data.get('text_url')
+            job.engine = data.get('engine', mode)
             job.completed_at = datetime.utcnow()
             db.session.commit()
+            logger.info(f"[stt={job_id}] ✅ done")
 
         except Exception as e:
-            logger.error(f"Job {job_id} failed: {e}")
-            job.status = 'failed'
-            job.error_message = str(e)[:500]
-            db.session.commit()
+            logger.exception(f"[stt={job_id}] ❌ failed: {e}")
+            try:
+                job.status = 'failed'
+                job.error_message = str(e)[:500]
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            try:
+                self.retry(exc=e, countdown=10)
+            except Exception:
+                pass
+
+
+# Backward compat alias
+process_tts = process_smart_tts
