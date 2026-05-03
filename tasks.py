@@ -1,4 +1,4 @@
-# tasks.py — V3.3 Fixed Imports (server -> app)
+# tasks.py — V3.4 Fully Synced
 import os
 import logging
 from datetime import datetime
@@ -24,10 +24,20 @@ MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
 MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
 
 @celery_app.task(bind=True, max_retries=2)
-def process_dub(self, job_id, file_key, lang, voice_id, sample_b64):
-    # ✅ تم التعديل هنا: from app بدلاً من from server
+def process_dub(self, payload_or_job_id, file_key=None, lang=None, voice_id=None, sample_b64=None):
     from app import app, db
     from models import DubbingJob, User
+    
+    # دعم التمرير عبر Dictionary (كما يفعل app.py الجديد) أو المتغيرات المباشرة (كما كان قديماً)
+    if isinstance(payload_or_job_id, dict):
+        job_id = payload_or_job_id.get('job_id')
+        file_key = payload_or_job_id.get('file_key')
+        lang = payload_or_job_id.get('lang')
+        voice_id = payload_or_job_id.get('voice_id')
+        sample_b64 = payload_or_job_id.get('sample_b64')
+    else:
+        job_id = payload_or_job_id
+
     with app.app_context():
         job = DubbingJob.query.get(job_id)
         if not job: return
@@ -35,7 +45,6 @@ def process_dub(self, job_id, file_key, lang, voice_id, sample_b64):
             job.status = 'processing'
             db.session.commit()
 
-            # جلب الرابط من S3 (بما أننا نرسل file_key الآن)
             import boto3
             from botocore.client import Config
             s3 = boto3.client('s3', 
@@ -45,7 +54,9 @@ def process_dub(self, job_id, file_key, lang, voice_id, sample_b64):
                               config=Config(signature_version='s3v4'), 
                               region_name='auto')
             R2_BUCKET = os.environ.get('R2_BUCKET_NAME')
-            media_url = s3.generate_presigned_url('get_object', Params={'Bucket': R2_BUCKET, 'Key': file_key}, ExpiresIn=7200)
+            
+            # إذا لم يتم تمرير media_url، نقوم بتوليده
+            media_url = s3.generate_presigned_url('get_object', Params={'Bucket': R2_BUCKET, 'Key': file_key}, ExpiresIn=7200) if file_key else None
 
             payload = {
                 'media_url': media_url, 'lang': lang, 'voice_id': voice_id,
@@ -58,7 +69,7 @@ def process_dub(self, job_id, file_key, lang, voice_id, sample_b64):
             if not data.get('success'): raise Exception(data.get('error', 'Unknown error'))
 
             job.status = 'completed'
-            job.output_url = data.get('audio_url') # تأكدنا من استخدام output_url كما في app.py
+            job.output_url = data.get('audio_url')
             db.session.commit()
 
         except Exception as e:
@@ -68,9 +79,9 @@ def process_dub(self, job_id, file_key, lang, voice_id, sample_b64):
             try: self.retry(exc=e, countdown=10)
             except Exception: pass
 
+# ✅ تم تغيير الاسم من process_smart_tts إلى process_tts ليتوافق مع السيرفر
 @celery_app.task(bind=True, max_retries=2)
-def process_smart_tts(self, payload):
-    # ✅ تم التعديل هنا: from app بدلاً من from server
+def process_tts(self, payload):
     from app import app, db
     from models import DubbingJob, User
     
@@ -105,7 +116,6 @@ def process_smart_tts(self, payload):
 
 @celery_app.task(bind=True, max_retries=2)
 def process_stt(self, job_id, media_url, language, mode, diarize, translate):
-    # ✅ تم التعديل هنا: from app بدلاً من from server
     from app import app, db
     from models import DubbingJob, User
     with app.app_context():
