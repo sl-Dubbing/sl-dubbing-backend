@@ -1,4 +1,4 @@
-# tasks.py — V3.4 Fully Synced
+# tasks.py — Final Sync for server.py
 import os
 import logging
 from datetime import datetime
@@ -24,20 +24,9 @@ MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
 MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
 
 @celery_app.task(bind=True, max_retries=2)
-def process_dub(self, payload_or_job_id, file_key=None, lang=None, voice_id=None, sample_b64=None):
-    from app import app, db
+def process_dub(self, job_id, media_url, lang, voice_id, sample_b64, engine):
+    from server import app, db
     from models import DubbingJob, User
-    
-    # دعم التمرير عبر Dictionary (كما يفعل app.py الجديد) أو المتغيرات المباشرة (كما كان قديماً)
-    if isinstance(payload_or_job_id, dict):
-        job_id = payload_or_job_id.get('job_id')
-        file_key = payload_or_job_id.get('file_key')
-        lang = payload_or_job_id.get('lang')
-        voice_id = payload_or_job_id.get('voice_id')
-        sample_b64 = payload_or_job_id.get('sample_b64')
-    else:
-        job_id = payload_or_job_id
-
     with app.app_context():
         job = DubbingJob.query.get(job_id)
         if not job: return
@@ -45,22 +34,9 @@ def process_dub(self, payload_or_job_id, file_key=None, lang=None, voice_id=None
             job.status = 'processing'
             db.session.commit()
 
-            import boto3
-            from botocore.client import Config
-            s3 = boto3.client('s3', 
-                              endpoint_url=os.environ.get('R2_ENDPOINT_URL'),
-                              aws_access_key_id=os.environ.get('R2_ACCESS_KEY_ID'),
-                              aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY'),
-                              config=Config(signature_version='s3v4'), 
-                              region_name='auto')
-            R2_BUCKET = os.environ.get('R2_BUCKET_NAME')
-            
-            # إذا لم يتم تمرير media_url، نقوم بتوليده
-            media_url = s3.generate_presigned_url('get_object', Params={'Bucket': R2_BUCKET, 'Key': file_key}, ExpiresIn=7200) if file_key else None
-
             payload = {
                 'media_url': media_url, 'lang': lang, 'voice_id': voice_id,
-                'sample_b64': sample_b64, 'engine': 'auto',
+                'sample_b64': sample_b64, 'engine': engine,
             }
             r = requests.post(f"{MODAL_DUBBING_URL}/upload-from-url", json=payload, timeout=1500)
             if r.status_code != 200: raise Exception(f"Modal Error: {r.text[:200]}")
@@ -69,23 +45,25 @@ def process_dub(self, payload_or_job_id, file_key=None, lang=None, voice_id=None
             if not data.get('success'): raise Exception(data.get('error', 'Unknown error'))
 
             job.status = 'completed'
-            job.output_url = data.get('audio_url')
+            job.audio_url = data.get('audio_url')
+            job.engine = data.get('engine_used', engine)
+            job.completed_at = datetime.utcnow()
+
+            user = User.query.get(job.user_id)
+            if user and user.credits > 0: user.credits -= 1
             db.session.commit()
 
         except Exception as e:
             job.status = 'failed'
-            job.error_message = str(e)[:500]
+            job.error = str(e)[:500]
             db.session.commit()
             try: self.retry(exc=e, countdown=10)
             except Exception: pass
 
-# ✅ تم تغيير الاسم من process_smart_tts إلى process_tts ليتوافق مع السيرفر
 @celery_app.task(bind=True, max_retries=2)
-def process_tts(self, payload):
-    from app import app, db
+def process_tts(self, job_id, text, lang, sample_b64='', voice_id='', rate=1.0, pitch=1.0):
+    from server import app, db
     from models import DubbingJob, User
-    
-    job_id = payload.get('job_id')
     with app.app_context():
         job = DubbingJob.query.get(job_id)
         if not job: return
@@ -93,10 +71,11 @@ def process_tts(self, payload):
             job.status = 'processing'
             db.session.commit()
 
-            sample_b64 = payload.get('sample_b64')
-            voice_id = payload.get('voice_id')
             endpoint = '/cloned' if (sample_b64 or voice_id) else '/fast'
-            
+            payload = {
+                'text': text, 'lang': lang, 'sample_b64': sample_b64, 
+                'voice_id': voice_id, 'rate': rate, 'pitch': pitch,
+            }
             r = requests.post(f"{MODAL_TTS_URL}{endpoint}", json=payload, timeout=600)
             if r.status_code != 200: raise Exception(f"Modal Error {r.status_code}")
             
@@ -104,19 +83,23 @@ def process_tts(self, payload):
             if not data.get('success'): raise Exception(data.get('error'))
 
             job.status = 'completed'
-            job.output_url = data.get('audio_url')
+            job.audio_url = data.get('audio_url')
+            job.completed_at = datetime.utcnow()
+
+            user = User.query.get(job.user_id)
+            if user and user.credits > 0: user.credits -= 1
             db.session.commit()
 
         except Exception as e:
             job.status = 'failed'
-            job.error_message = str(e)[:500]
+            job.error = str(e)[:500]
             db.session.commit()
             try: self.retry(exc=e, countdown=10)
             except Exception: pass
 
 @celery_app.task(bind=True, max_retries=2)
 def process_stt(self, job_id, media_url, language, mode, diarize, translate):
-    from app import app, db
+    from server import app, db
     from models import DubbingJob, User
     with app.app_context():
         job = DubbingJob.query.get(job_id)
@@ -139,12 +122,17 @@ def process_stt(self, job_id, media_url, language, mode, diarize, translate):
             if not data.get('success'): raise Exception(data.get('error', 'Unknown'))
 
             job.status = 'completed'
-            job.output_url = data.get('json_url') or data.get('text_url')
+            job.audio_url = data.get('json_url') or data.get('text_url')
+            job.engine = data.get('engine', mode)
+            job.completed_at = datetime.utcnow()
+
+            user = User.query.get(job.user_id)
+            if user and user.credits > 0: user.credits -= 1
             db.session.commit()
 
         except Exception as e:
             job.status = 'failed'
-            job.error_message = str(e)[:500]
+            job.error = str(e)[:500]
             db.session.commit()
             try: self.retry(exc=e, countdown=10)
             except Exception: pass
