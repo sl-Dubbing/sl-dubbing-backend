@@ -1,4 +1,4 @@
-# server.py — V3.4 The Ultimate Master Version
+# server.py — V3.5 Final String ID Fix
 import os
 import uuid
 import logging
@@ -13,7 +13,6 @@ import requests as _requests
 
 from models import db, User, DubbingJob 
 
-# تجنب الخطأ إذا كان stt غير موجود حالياً في tasks
 try:
     from tasks import process_dub, process_tts, process_stt
 except ImportError:
@@ -59,7 +58,7 @@ def token_required(f):
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'version': 'v3.4-ultimate'})
+    return jsonify({'status': 'ok', 'version': 'v3.5-fixed'})
 
 @app.route('/api/user/credits', methods=['GET'])
 @token_required
@@ -128,7 +127,10 @@ def start_dubbing(user):
     
     media_url = s3.generate_presigned_url('get_object', Params={'Bucket': R2_BUCKET, 'Key': file_key}, ExpiresIn=7200)
     
+    # ⚠️ ملاحظة: نولد UUID جديد للمهمة هنا ليتوافق مع String
+    new_job_id = str(uuid.uuid4())
     job = DubbingJob(
+        id=new_job_id,
         user_id=user.id, kind='dub', lang=data.get('lang', 'en'), 
         voice_id=data.get('voice_id', 'source'), engine=data.get('engine', 'auto'),
         status='queued', input_key=file_key, custom_name=data.get('filename'),
@@ -137,7 +139,6 @@ def start_dubbing(user):
     db.session.add(job)
     db.session.commit()
     
-    # إرسال المتغيرات الكاملة لمهمة الـ Celery
     process_dub.delay(
         job_id=job.id, media_url=media_url, lang=job.lang, 
         voice_id=job.voice_id, sample_b64=data.get('sample_b64', ''), engine=job.engine
@@ -152,7 +153,8 @@ def start_tts(user):
     text = data.get('text', '').strip()
     if not text: return jsonify({'error': 'Text required'}), 400
     
-    job = DubbingJob(user_id=user.id, kind='tts', lang=data.get('lang', 'ar'), 
+    new_job_id = str(uuid.uuid4())
+    job = DubbingJob(id=new_job_id, user_id=user.id, kind='tts', lang=data.get('lang', 'ar'), 
                      status='queued', custom_name=data.get('filename', text[:20]),
                      created_at=datetime.utcnow())
     db.session.add(job)
@@ -200,7 +202,9 @@ def start_stt(user):
     
     media_url = s3.generate_presigned_url('get_object', Params={'Bucket': R2_BUCKET, 'Key': file_key}, ExpiresIn=7200)
     
+    new_job_id = str(uuid.uuid4())
     job = DubbingJob(
+        id=new_job_id,
         user_id=user.id, kind='stt', lang=data.get('language', 'auto'),
         status='queued', input_key=file_key, custom_name="تفريغ صوتي",
         created_at=datetime.utcnow()
@@ -218,7 +222,8 @@ def start_stt(user):
     return jsonify({'success': True, 'job_id': job.id})
 
 # =================📡 فحص حالة المهام=================
-@app.route('/api/job/<int:job_id>', methods=['GET'])
+# ✅ تم إصلاح المسار هنا: إزالة <int:job_id> واستبدالها بـ <job_id>
+@app.route('/api/job/<job_id>', methods=['GET'])
 @token_required
 def job_status(user, job_id):
     job = DubbingJob.query.filter_by(id=job_id, user_id=user.id).first()
