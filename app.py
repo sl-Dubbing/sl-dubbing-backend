@@ -1,4 +1,4 @@
-# app.py — V1.5 (Fixed Arabic Filenames & Transaction conflict)
+# app.py — V1.7 (Accept Global Filenames & Multiple Audio/Video Extensions)
 import os
 import asyncio
 import logging
@@ -74,13 +74,19 @@ s3_client = boto3.client(
 )
 R2_PUBLIC_BASE = os.environ.get('R2_PUBLIC_BASE')
 
-ALLOWED_EXTENSIONS = {'mp4', 'mp3', 'wav', 'm4a', 'mov', 'webm', 'mkv', 'aac', 'ogg', 'flac'}
 MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', 5000))
 
+# ✅ قائمة شاملة لامتدادات الفيديو والصوت
+ALLOWED_EXTENSIONS = {
+    # Video
+    'mp4', 'mov', 'avi', 'mkv', 'webm', 'flv', 'wmv', 'm4v', '3gp',
+    # Audio
+    'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a', 'wma', 'aiff'
+}
 
 def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
+    """التحقق من أن الامتداد ضمن القائمة المسموحة"""
+    return '.' in filename and filename.rsplit('.', 1)[-1].lower() in ALLOWED_EXTENSIONS
 
 def json_required(f):
     @wraps(f)
@@ -124,7 +130,6 @@ def token_required(f):
                                       algorithms=['HS256'],
                                       options={'verify_aud': False})
             else:
-                # ES256/RS256 - decode بدون verification (مؤقت)
                 logger.warning(f"Token alg={token_alg}, decoding without signature verification")
                 data = jwt.decode(token, options={"verify_signature": False})
 
@@ -157,10 +162,6 @@ def token_required(f):
 # 💳 خصم الرصيد - مبسّط
 # ==========================================
 def deduct_credits(user_id, amount, job_id=None):
-    """
-    خصم رصيد آمن. يستخدم refresh للتحقق من القيمة الحالية.
-    يعيد True عند النجاح، False عند عدم كفاية الرصيد.
-    """
     try:
         user = User.query.get(user_id)
         if not user or (user.credits or 0) < amount:
@@ -211,7 +212,7 @@ def health_check():
         db.session.execute("SELECT 1")
     except Exception:
         db_ok = False
-    return jsonify({"status": "ok", "version": "v1.5-arabic-names-fixed", "db": "ok" if db_ok else "error"}), 200
+    return jsonify({"status": "ok", "version": "v1.7-global-filenames", "db": "ok" if db_ok else "error"}), 200
 
 
 @app.route('/api/user', methods=['GET'])
@@ -240,13 +241,14 @@ def get_credits(current_user):
 def get_upload_url(current_user):
     data = request.json or {}
     
-    # ✅ الإصلاح هنا: قمنا بإلغاء secure_filename التي كانت تحذف الأسماء العربية
+    # أخذ الاسم كما هو لدعم جميع اللغات
     raw_filename = data.get('filename', 'file.bin')
     content_type = data.get('content_type', 'application/octet-stream')
     size = int(data.get('size', 0))
 
+    # التحقق من أن الامتداد مدعوم (صوت أو فيديو)
     if not allowed_file(raw_filename):
-        return jsonify({'error': 'Unsupported file type'}), 400
+         return jsonify({'error': 'Unsupported file type. Please upload a valid audio or video file.'}), 400
 
     max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
     if size > max_bytes:
@@ -255,8 +257,8 @@ def get_upload_url(current_user):
     if (current_user.credits or 0) < 1:
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    # استخراج الامتداد بشكل آمن لتجنب مشاكل الأسماء العربية
-    ext = raw_filename.rsplit('.', 1)[-1].lower() if '.' in raw_filename else 'bin'
+    # استخراج الامتداد لتكوين مسار آمن في R2
+    ext = raw_filename.rsplit('.', 1)[-1].lower()
     file_key = f"uploads/u{current_user.id}/{uuid.uuid4().hex}.{ext}"
 
     try:
@@ -282,6 +284,67 @@ def get_upload_url(current_user):
         logger.exception(f"upload-url failed: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ==========================================
+# الدعم القديم للرفع عبر FormData (إن وجد)
+# ==========================================
+@app.route('/api/dubbing', methods=['POST'])
+@token_required
+def start_dubbing_legacy(current_user):
+    cost = int(os.environ.get('DUB_COST', 100))
+
+    file = request.files.get('media_file')
+    if not file:
+        return jsonify({'error': 'No file'}), 400
+
+    raw_filename = file.filename or ''
+    if not allowed_file(raw_filename):
+        return jsonify({'error': 'Unsupported file type. Please upload a valid audio or video file.'}), 400
+
+    if (current_user.credits or 0) < cost:
+        return jsonify({'error': 'Insufficient credits'}), 402
+
+    job_id = str(uuid.uuid4())
+    if not deduct_credits(current_user.id, cost, job_id=job_id):
+        return jsonify({'error': 'Insufficient credits'}), 402
+
+    new_job = DubbingJob(
+        id=job_id,
+        user_id=current_user.id,
+        status='pending',
+        language=request.form.get('lang', 'ar'),
+        method='dubbing',
+        voice_id=request.form.get('voice_id', 'source'),
+        credits_used=cost,
+    )
+    db.session.add(new_job)
+    db.session.flush()
+
+    ext = raw_filename.rsplit('.', 1)[-1].lower()
+    file_key = f"uploads/u{current_user.id}/{uuid.uuid4().hex}.{ext}"
+    try:
+        file.stream.seek(0)
+        s3_client.upload_fileobj(file.stream, R2_BUCKET_NAME, file_key)
+    except Exception as e:
+        logger.exception(f"Upload failed: {e}")
+        refund_credits(current_user.id, cost, new_job.id)
+        return jsonify({'error': 'Upload failed'}), 500
+
+    new_job.file_key = file_key
+    new_job.status = 'processing'
+    db.session.commit()
+
+    try:
+        process_dub.delay({
+            'job_id': new_job.id,
+            'file_key': file_key,
+            'lang': new_job.language,
+            'voice_id': new_job.voice_id,
+            'sample_b64': request.form.get('sample_b64', ''),
+        })
+    except Exception as e:
+        logger.exception(f"Enqueue failed: {e}")
+
+    return jsonify({'success': True, 'job_id': new_job.id}), 202
 
 # ==========================================
 # 🎬 /api/dub
@@ -309,12 +372,10 @@ def start_dub(current_user):
     if (current_user.credits or 0) < cost:
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    # 1. خصم الرصيد أولاً
     job_id = str(uuid.uuid4())
     if not deduct_credits(current_user.id, cost, job_id=job_id):
         return jsonify({'error': 'Insufficient credits'}), 402
 
-    # 2. إنشاء الـ job
     try:
         new_job = DubbingJob(
             id=job_id,
@@ -335,7 +396,6 @@ def start_dub(current_user):
         refund_credits(current_user.id, cost, job_id)
         return jsonify({'error': 'Job creation failed'}), 500
 
-    # 3. إرسال للـ Celery
     try:
         process_dub.delay({
             'job_id': new_job.id,
