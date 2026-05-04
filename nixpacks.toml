@@ -1,13 +1,2 @@
-# nixpacks.toml
-
 [phases.setup]
-# إخبار النظام بتثبيت لغة بايثون والإضافات الضرورية
-nixPkgs = ["python311", "gcc"] 
-
-[phases.install]
-# التأكد من تحديث pip وتثبيت المتطلبات
-cmds = ["python3 -m venv /opt/venv && /opt/venv/bin/pip install --upgrade pip && /opt/venv/bin/pip install -r requirements.txt"]
-
-[phases.start]
-# أمر التشغيل (تأكد من تعديله ليناسب مشروعك، هنا مثال للـ worker)
-cmd = "/opt/venv/bin/python main.py"
+aptPkgs = ['ffmpeg']
