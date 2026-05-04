@@ -199,6 +199,36 @@ def process_dub(self, *args, **kwargs):
                 raise Exception(data.get('error', 'Modal returned success=false'))
 
             audio_url = data.get('audio_url')
+            # ===========================================
+# 🎭 PROSODY TRANSFER (مستوى ElevenLabs Pro)
+# ===========================================
+prosody_audio_url = audio_url  # الافتراضي: لا تغيير
+
+if MODAL_PROSODY_URL and media_url and payload.get('apply_prosody', True):
+    try:
+        logger.info(f"[job={job_id}] 🎭 → Prosody Transfer")
+        prosody_resp = requests.post(
+            f"{MODAL_PROSODY_URL.rstrip('/')}/transfer",
+            json={
+                'source_audio_url': media_url,        # الأصلي
+                'target_audio_url': audio_url,        # المدبلج
+                'level': payload.get('prosody_level', 'pro'),  # basic|pro|max
+                'method': 'world',
+                'intensity': float(payload.get('prosody_intensity', 0.7)),
+            },
+            timeout=600
+        )
+        if prosody_resp.status_code == 200:
+            pdata = prosody_resp.json()
+            if pdata.get('success'):
+                prosody_audio_url = pdata.get('audio_url', audio_url)
+                logger.info(f"[job={job_id}] ✅ Prosody applied: "
+                           f"emotion={pdata.get('emotion', {}).get('dominant', 'N/A')}")
+    except Exception as e:
+        logger.warning(f"[job={job_id}] Prosody failed: {e}, using original")
+
+# استبدل audio_url بـ prosody_audio_url في باقي الكود
+audio_url = prosody_audio_url
             final_url = audio_url
             output_type = "audio"
 
