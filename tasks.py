@@ -1,4 +1,4 @@
-# tasks.py — V5.1 (متوافق مع app.py + models.py) — Prosody retries + timing logs
+# tasks.py — V5.2 (on-demand safe mode)
 import os
 import logging
 import tempfile
@@ -33,6 +33,22 @@ MODAL_PROSODY_URL = os.environ.get('MODAL_PROSODY_URL')  # Prosody Transfer
 # Optional API key for Prosody service (if required)
 MODAL_PROSODY_KEY = os.environ.get('MODAL_PROSODY_KEY')
 
+# -------------------------
+# On-demand guard (default: disabled)
+# Set ENABLE_ON_DEMAND=1 in environment to allow processing
+# -------------------------
+ENABLE_ON_DEMAND = os.environ.get('ENABLE_ON_DEMAND', '0') == '1'
+
+
+def _ffmpeg(args, **kwargs):
+    return subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error"] + args,
+        capture_output=True, text=True,
+        timeout=kwargs.get("timeout", 120),
+        check=kwargs.get("check", False),
+    )
+
+
 def _merge_video_audio_locally(media_url, dubbed_audio_url):
     """
     🎬 دمج فيديو + صوت مدبلج محلياً (بدون Modal)
@@ -48,7 +64,7 @@ def _merge_video_audio_locally(media_url, dubbed_audio_url):
         if result.returncode != 0:
             logger.error("❌ ffmpeg test failed")
             return None
-        logger.info(f"✅ ffmpeg available: {result.stdout.decode()[:80]}")
+        logger.info(f"✅ ffmpeg available")
     except FileNotFoundError:
         logger.error("❌ ffmpeg NOT INSTALLED in worker. Add aptPkgs=['ffmpeg'] to nixpacks.toml")
         return None
@@ -145,7 +161,7 @@ def _build_presigned_url(file_key, expires=7200):
 
 
 # ==========================================
-# 🎬 process_dub — للدبلجة
+# 🎬 process_dub — للدبلجة (on-demand guard)
 # ==========================================
 @celery_app.task(bind=True, max_retries=2)
 def process_dub(self, *args, **kwargs):
@@ -167,6 +183,18 @@ def process_dub(self, *args, **kwargs):
         job = DubbingJob.query.get(job_id)
         if not job:
             logger.error(f"Job {job_id} not found")
+            return
+
+        # -------------------------
+        # On-demand guard: if not enabled, skip processing immediately
+        # -------------------------
+        if not ENABLE_ON_DEMAND:
+            logger.info(f"[job={job_id}] On-demand mode disabled — skipping processing")
+            try:
+                job.status = 'pending'
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
             return
 
         try:
@@ -210,14 +238,15 @@ def process_dub(self, *args, **kwargs):
             prosody_audio_url = audio_url  # الافتراضي: لا تغيير
 
             # نفّذ نقل الـ prosody إذا كان endpoint معرفاً، ووسائط متاحة، وطلب المستخدم يسمح بذلك
-            if MODAL_PROSODY_URL and media_url and payload.get('apply_prosody', True):
+            # ملاحظة: apply_prosody افتراضياً False الآن
+            if MODAL_PROSODY_URL and media_url and payload.get('apply_prosody', False):
                 headers = {}
                 if MODAL_PROSODY_KEY:
                     headers['Authorization'] = f"Bearer {MODAL_PROSODY_KEY}"
 
                 prosody_endpoint = f"{MODAL_PROSODY_URL.rstrip('/')}/transfer"
-                attempts = int(payload.get('prosody_attempts', 3))
-                backoff = float(payload.get('prosody_backoff', 2.0))
+                attempts = int(payload.get('prosody_attempts', 1))  # default 1 attempt
+                backoff = float(payload.get('prosody_backoff', 1.0))
                 prosody_resp = None
                 t_start = time.time()
                 for attempt in range(1, attempts + 1):
@@ -249,7 +278,6 @@ def process_dub(self, *args, **kwargs):
                                 break
                             else:
                                 logger.warning(f"[job={job_id}] Prosody returned success=false: {pdata.get('error')}")
-                                # don't retry on explicit failure unless transient; still retry by default
                         else:
                             logger.warning(f"[job={job_id}] Prosody HTTP {prosody_resp.status_code}: {prosody_resp.text[:300]}")
                     except RequestException as e:
@@ -266,7 +294,6 @@ def process_dub(self, *args, **kwargs):
                 total_dt = time.time() - t_start
                 logger.info(f"[job={job_id}] 🎭 Prosody attempts finished in {total_dt:.1f}s")
 
-                # If prosody_resp exists but never returned success, we keep original audio_url (fallback)
                 if prosody_resp is None:
                     logger.warning(f"[job={job_id}] Prosody never responded, using original audio_url")
 
@@ -342,6 +369,7 @@ def process_dub(self, *args, **kwargs):
             try:
                 job.status = 'failed'
                 job.error_message = str(e)[:500]
+                job.completed_at = datetime.utcnow()
                 db.session.commit()
             except Exception:
                 db.session.rollback()
@@ -406,6 +434,7 @@ def process_smart_tts(self, *args, **kwargs):
             try:
                 job.status = 'failed'
                 job.error_message = str(e)[:500]
+                job.completed_at = datetime.utcnow()
                 db.session.commit()
             except Exception:
                 db.session.rollback()
@@ -481,6 +510,7 @@ def process_stt(self, *args, **kwargs):
             try:
                 job.status = 'failed'
                 job.error_message = str(e)[:500]
+                job.completed_at = datetime.utcnow()
                 db.session.commit()
             except Exception:
                 db.session.rollback()
