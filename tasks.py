@@ -39,9 +39,16 @@ def _merge_video_audio_locally(media_url, dubbed_audio_url):
 
     # تحقّق من ffmpeg
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5, check=True)
-    except Exception:
-        logger.error("ffmpeg not available in worker")
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            logger.error("❌ ffmpeg test failed")
+            return None
+        logger.info(f"✅ ffmpeg available: {result.stdout.decode()[:80]}")
+    except FileNotFoundError:
+        logger.error("❌ ffmpeg NOT INSTALLED in worker. Add aptPkgs=['ffmpeg'] to nixpacks.toml")
+        return None
+    except Exception as e:
+        logger.error(f"❌ ffmpeg check failed: {e}")
         return None
 
     temp_dir = tempfile.mkdtemp()
@@ -198,9 +205,13 @@ def process_dub(self, *args, **kwargs):
             # ===========================================
             # 🎬 VIDEO OUTPUT - منطق ذكي
             # ===========================================
-            file_ext = (file_key or '').rsplit('.', 1)[-1].lower() if file_key else ''
-            video_exts = {'mp4', 'mov', 'mkv', 'webm', 'avi', 'mpg', 'mpeg', 'm4v'}
-            is_video = file_ext in video_exts
+            # كشف نوع الملف من file_key أو من media_url
+            source_str = (file_key or media_url or '').lower()
+            video_exts = ['.mp4', '.mov', '.mkv', '.webm', '.avi', '.mpg', '.mpeg', '.m4v']
+            is_video = any(ext in source_str for ext in video_exts)
+
+            logger.info(f"[job={job_id}] 🔍 file={source_str[:80]}, is_video={is_video}, "
+                       f"video_output={video_output}, with_lipsync={with_lipsync}")
 
             if is_video and video_output and media_url:
                 # Path 1: مع lip sync → استخدم Modal (LatentSync)
@@ -222,6 +233,10 @@ def process_dub(self, *args, **kwargs):
                                 final_url = smart_data.get('output_url', audio_url)
                                 output_type = smart_data.get('output_type', 'audio')
                                 logger.info(f"[job={job_id}] ✅ LipSync done")
+                            else:
+                                logger.warning(f"[job={job_id}] LipSync data: {smart_data}")
+                        else:
+                            logger.warning(f"[job={job_id}] LipSync HTTP {smart_resp.status_code}")
                     except Exception as e:
                         logger.warning(f"[job={job_id}] LipSync failed: {e}")
 
@@ -232,9 +247,13 @@ def process_dub(self, *args, **kwargs):
                     if merged_url:
                         final_url = merged_url
                         output_type = "video"
-                        logger.info(f"[job={job_id}] ✅ Video merged locally")
+                        logger.info(f"[job={job_id}] ✅ Video merged: {merged_url[:80]}")
                     else:
-                        logger.warning(f"[job={job_id}] Local merge failed, using audio")
+                        logger.warning(f"[job={job_id}] ⚠️ Merge returned None - check ffmpeg")
+            elif not is_video:
+                logger.info(f"[job={job_id}] 📻 Audio file detected, skipping video merge")
+            elif not video_output:
+                logger.info(f"[job={job_id}] 🔇 video_output=False, audio only")
 
             # ✅ نجح
             job.status = 'completed'
