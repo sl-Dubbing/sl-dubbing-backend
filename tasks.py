@@ -26,6 +26,8 @@ MODAL_TTS_URL = os.environ.get('MODAL_TTS_URL')
 MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
 MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
 MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')  # Smart Video Dubber
+# Prosody Transfer endpoint (ElevenLabs‑Pro style)
+MODAL_PROSODY_URL = os.environ.get('MODAL_PROSODY_URL')  # Prosody Transfer
 
 
 def _merge_video_audio_locally(media_url, dubbed_audio_url):
@@ -200,35 +202,42 @@ def process_dub(self, *args, **kwargs):
 
             audio_url = data.get('audio_url')
             # ===========================================
-# 🎭 PROSODY TRANSFER (مستوى ElevenLabs Pro)
-# ===========================================
-prosody_audio_url = audio_url  # الافتراضي: لا تغيير
+            # 🎭 PROSODY TRANSFER (مستوى ElevenLabs Pro)
+            # ===========================================
+            prosody_audio_url = audio_url  # الافتراضي: لا تغيير
 
-if MODAL_PROSODY_URL and media_url and payload.get('apply_prosody', True):
-    try:
-        logger.info(f"[job={job_id}] 🎭 → Prosody Transfer")
-        prosody_resp = requests.post(
-            f"{MODAL_PROSODY_URL.rstrip('/')}/transfer",
-            json={
-                'source_audio_url': media_url,        # الأصلي
-                'target_audio_url': audio_url,        # المدبلج
-                'level': payload.get('prosody_level', 'pro'),  # basic|pro|max
-                'method': 'world',
-                'intensity': float(payload.get('prosody_intensity', 0.7)),
-            },
-            timeout=600
-        )
-        if prosody_resp.status_code == 200:
-            pdata = prosody_resp.json()
-            if pdata.get('success'):
-                prosody_audio_url = pdata.get('audio_url', audio_url)
-                logger.info(f"[job={job_id}] ✅ Prosody applied: "
-                           f"emotion={pdata.get('emotion', {}).get('dominant', 'N/A')}")
-    except Exception as e:
-        logger.warning(f"[job={job_id}] Prosody failed: {e}, using original")
+            # نفّذ نقل الـ prosody إذا كان endpoint معرفاً، ووسائط متاحة، وطلب المستخدم يسمح بذلك
+            if MODAL_PROSODY_URL and media_url and payload.get('apply_prosody', True):
+                try:
+                    logger.info(f"[job={job_id}] 🎭 → Prosody Transfer")
+                    prosody_resp = requests.post(
+                        f"{MODAL_PROSODY_URL.rstrip('/')}/transfer",
+                        json={
+                            'source_audio_url': media_url,        # الأصلي
+                            'target_audio_url': audio_url,        # المدبلج
+                            'level': payload.get('prosody_level', 'pro'),  # basic|pro|max
+                            'method': 'world',
+                            'intensity': float(payload.get('prosody_intensity', 0.7)),
+                        },
+                        timeout=600
+                    )
+                    if prosody_resp.status_code == 200:
+                        pdata = prosody_resp.json()
+                        if pdata.get('success'):
+                            prosody_audio_url = pdata.get('audio_url', audio_url)
+                            logger.info(
+                                f"[job={job_id}] ✅ Prosody applied: "
+                                f"emotion={pdata.get('emotion', {}).get('dominant', 'N/A')}"
+                            )
+                        else:
+                            logger.warning(f"[job={job_id}] Prosody service returned success=false: {pdata.get('error')}")
+                    else:
+                        logger.warning(f"[job={job_id}] Prosody HTTP {prosody_resp.status_code}: {prosody_resp.text[:300]}")
+                except Exception as e:
+                    logger.warning(f"[job={job_id}] Prosody failed: {e}, using original")
 
-# استبدل audio_url بـ prosody_audio_url في باقي الكود
-audio_url = prosody_audio_url
+            # استبدل audio_url بالنتيجة (سواء تم التعديل أم لا)
+            audio_url = prosody_audio_url
             final_url = audio_url
             output_type = "audio"
 
@@ -246,7 +255,6 @@ audio_url = prosody_audio_url
             if is_video and video_output and media_url:
                 # Path 1: مع lip sync → استخدم Modal (LatentSync)
                 if with_lipsync and MODAL_LIPSYNC_URL:
-                    MODAL_PROSODY_URL = os.environ.get('MODAL_PROSODY_URL')  # Prosody Transfer
                     try:
                         logger.info(f"[job={job_id}] 🎬 → LatentSync (Modal)")
                         smart_url = f"{MODAL_LIPSYNC_URL.rstrip('/')}/dub-video"
