@@ -1,12 +1,14 @@
-# tasks.py — V5.0 (متوافق مع app.py + models.py)
+# tasks.py — V5.1 (متوافق مع app.py + models.py) — Prosody retries + timing logs
 import os
 import logging
 import tempfile
 import subprocess
 import uuid
+import time
 from datetime import datetime
 from celery import Celery
 import requests
+from requests.exceptions import RequestException
 
 logger = logging.getLogger("sl-tasks")
 
@@ -28,7 +30,8 @@ MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
 MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')  # Smart Video Dubber
 # Prosody Transfer endpoint (ElevenLabs‑Pro style)
 MODAL_PROSODY_URL = os.environ.get('MODAL_PROSODY_URL')  # Prosody Transfer
-
+# Optional API key for Prosody service (if required)
+MODAL_PROSODY_KEY = os.environ.get('MODAL_PROSODY_KEY')
 
 def _merge_video_audio_locally(media_url, dubbed_audio_url):
     """
@@ -208,33 +211,64 @@ def process_dub(self, *args, **kwargs):
 
             # نفّذ نقل الـ prosody إذا كان endpoint معرفاً، ووسائط متاحة، وطلب المستخدم يسمح بذلك
             if MODAL_PROSODY_URL and media_url and payload.get('apply_prosody', True):
-                try:
-                    logger.info(f"[job={job_id}] 🎭 → Prosody Transfer")
-                    prosody_resp = requests.post(
-                        f"{MODAL_PROSODY_URL.rstrip('/')}/transfer",
-                        json={
-                            'source_audio_url': media_url,        # الأصلي
-                            'target_audio_url': audio_url,        # المدبلج
-                            'level': payload.get('prosody_level', 'pro'),  # basic|pro|max
-                            'method': 'world',
-                            'intensity': float(payload.get('prosody_intensity', 0.7)),
-                        },
-                        timeout=600
-                    )
-                    if prosody_resp.status_code == 200:
-                        pdata = prosody_resp.json()
-                        if pdata.get('success'):
-                            prosody_audio_url = pdata.get('audio_url', audio_url)
-                            logger.info(
-                                f"[job={job_id}] ✅ Prosody applied: "
-                                f"emotion={pdata.get('emotion', {}).get('dominant', 'N/A')}"
-                            )
+                headers = {}
+                if MODAL_PROSODY_KEY:
+                    headers['Authorization'] = f"Bearer {MODAL_PROSODY_KEY}"
+
+                prosody_endpoint = f"{MODAL_PROSODY_URL.rstrip('/')}/transfer"
+                attempts = int(payload.get('prosody_attempts', 3))
+                backoff = float(payload.get('prosody_backoff', 2.0))
+                prosody_resp = None
+                t_start = time.time()
+                for attempt in range(1, attempts + 1):
+                    try:
+                        logger.info(f"[job={job_id}] 🎭 → Prosody Transfer attempt {attempt}/{attempts}")
+                        call_t0 = time.time()
+                        prosody_resp = requests.post(
+                            prosody_endpoint,
+                            json={
+                                'source_audio_url': media_url,        # الأصلي
+                                'target_audio_url': audio_url,        # المدبلج
+                                'level': payload.get('prosody_level', 'pro'),  # basic|pro|max
+                                'method': 'world',
+                                'intensity': float(payload.get('prosody_intensity', 0.7)),
+                            },
+                            headers=headers,
+                            timeout=600
+                        )
+                        call_dt = time.time() - call_t0
+                        logger.info(f"[job={job_id}] 🎭 Prosody HTTP status={prosody_resp.status_code} (attempt {attempt}) took {call_dt:.1f}s")
+                        if prosody_resp.status_code == 200:
+                            pdata = prosody_resp.json()
+                            if pdata.get('success'):
+                                prosody_audio_url = pdata.get('audio_url', audio_url)
+                                logger.info(
+                                    f"[job={job_id}] ✅ Prosody applied: "
+                                    f"emotion={pdata.get('emotion', {}).get('dominant', 'N/A')}"
+                                )
+                                break
+                            else:
+                                logger.warning(f"[job={job_id}] Prosody returned success=false: {pdata.get('error')}")
+                                # don't retry on explicit failure unless transient; still retry by default
                         else:
-                            logger.warning(f"[job={job_id}] Prosody service returned success=false: {pdata.get('error')}")
-                    else:
-                        logger.warning(f"[job={job_id}] Prosody HTTP {prosody_resp.status_code}: {prosody_resp.text[:300]}")
-                except Exception as e:
-                    logger.warning(f"[job={job_id}] Prosody failed: {e}, using original")
+                            logger.warning(f"[job={job_id}] Prosody HTTP {prosody_resp.status_code}: {prosody_resp.text[:300]}")
+                    except RequestException as e:
+                        logger.warning(f"[job={job_id}] Prosody request exception (attempt {attempt}): {e}")
+                    except Exception as e:
+                        logger.exception(f"[job={job_id}] Prosody unexpected error (attempt {attempt}): {e}")
+
+                    # backoff before next attempt
+                    if attempt < attempts:
+                        sleep_time = backoff * (2 ** (attempt - 1))
+                        logger.info(f"[job={job_id}] Prosody retry sleeping {sleep_time:.1f}s before next attempt")
+                        time.sleep(sleep_time)
+
+                total_dt = time.time() - t_start
+                logger.info(f"[job={job_id}] 🎭 Prosody attempts finished in {total_dt:.1f}s")
+
+                # If prosody_resp exists but never returned success, we keep original audio_url (fallback)
+                if prosody_resp is None:
+                    logger.warning(f"[job={job_id}] Prosody never responded, using original audio_url")
 
             # استبدل audio_url بالنتيجة (سواء تم التعديل أم لا)
             audio_url = prosody_audio_url
