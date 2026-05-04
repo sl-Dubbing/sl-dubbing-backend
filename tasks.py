@@ -1,4 +1,4 @@
-# tasks.py — V5.2 (on-demand safe mode)
+# tasks.py — V5.2 (on-demand safe mode + smart routing)
 import os
 import logging
 import tempfile
@@ -28,6 +28,17 @@ MODAL_TTS_URL = os.environ.get('MODAL_TTS_URL')
 MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
 MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
 MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')  # Smart Video Dubber
+# 🆕 SMART ROUTING - Local PC vs Modal
+PROCESSING_BACKEND = os.environ.get('PROCESSING_BACKEND', 'modal').lower()
+LOCAL_PROCESSING_URL = os.environ.get('LOCAL_PROCESSING_URL', '')
+
+def get_processing_url():
+    if PROCESSING_BACKEND == 'local' and LOCAL_PROCESSING_URL:
+        logger.info(f"🏠 Using LOCAL backend (RTX 3060)")
+        return LOCAL_PROCESSING_URL
+    logger.info(f"☁️ Using MODAL backend")
+    return MODAL_DUBBING_URL
+
 # Prosody Transfer endpoint (ElevenLabs‑Pro style)
 MODAL_PROSODY_URL = os.environ.get('MODAL_PROSODY_URL')  # Prosody Transfer
 # Optional API key for Prosody service (if required)
@@ -216,20 +227,23 @@ def process_dub(self, *args, **kwargs):
                 'engine': engine,
             }
 
-            logger.info(f"[job={job_id}] → Modal {MODAL_DUBBING_URL}/upload-from-url")
+            # ===== use smart routing to choose backend URL =====
+            backend_url = get_processing_url()
+            url = f"{backend_url.rstrip('/')}/upload-from-url"
+            logger.info(f"[job={job_id}] → Upload endpoint {url}")
 
             r = requests.post(
-                f"{MODAL_DUBBING_URL}/upload-from-url",
+                url,
                 json=modal_payload,
                 timeout=1500
             )
 
             if r.status_code != 200:
-                raise Exception(f"Modal HTTP {r.status_code}: {r.text[:300]}")
+                raise Exception(f"Processing HTTP {r.status_code}: {r.text[:300]}")
 
             data = r.json()
             if not data.get('success'):
-                raise Exception(data.get('error', 'Modal returned success=false'))
+                raise Exception(data.get('error', 'Processing returned success=false'))
 
             audio_url = data.get('audio_url')
             # ===========================================
