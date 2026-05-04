@@ -216,6 +216,7 @@ def process_dub(self, *args, **kwargs):
             if is_video and video_output and media_url:
                 # Path 1: مع lip sync → استخدم Modal (LatentSync)
                 if with_lipsync and MODAL_LIPSYNC_URL:
+                    MODAL_PROSODY_URL = os.environ.get('MODAL_PROSODY_URL')  # Prosody Transfer
                     try:
                         logger.info(f"[job={job_id}] 🎬 → LatentSync (Modal)")
                         smart_url = f"{MODAL_LIPSYNC_URL.rstrip('/')}/dub-video"
