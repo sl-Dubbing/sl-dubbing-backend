@@ -10,6 +10,10 @@ from celery import Celery
 import requests
 from requests.exceptions import RequestException
 
+# نقلنا هذه المكتبات للأعلى لتسريع الأداء (بدل تحميلها في كل مرة)
+import boto3
+from botocore.client import Config
+
 logger = logging.getLogger("sl-tasks")
 
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
@@ -28,6 +32,7 @@ MODAL_TTS_URL = os.environ.get('MODAL_TTS_URL')
 MODAL_STT_URL = os.environ.get('MODAL_STT_URL')
 MODAL_STT_PRECISE_URL = os.environ.get('MODAL_STT_PRECISE_URL', MODAL_STT_URL)
 MODAL_LIPSYNC_URL = os.environ.get('MODAL_LIPSYNC_URL')  # Smart Video Dubber
+
 # 🆕 SMART ROUTING - Local PC vs Modal
 PROCESSING_BACKEND = os.environ.get('PROCESSING_BACKEND', 'modal').lower()
 LOCAL_PROCESSING_URL = os.environ.get('LOCAL_PROCESSING_URL', '')
@@ -65,8 +70,6 @@ def _merge_video_audio_locally(media_url, dubbed_audio_url):
     🎬 دمج فيديو + صوت مدبلج محلياً (بدون Modal)
     سريع جداً (~10 ثوان لفيديو دقيقة) ولا يحتاج GPU.
     """
-    import boto3
-    from botocore.client import Config
     import shutil
 
     # تحقّق من ffmpeg
@@ -153,8 +156,6 @@ def _merge_video_audio_locally(media_url, dubbed_audio_url):
 
 def _build_presigned_url(file_key, expires=7200):
     """يولّد رابط مؤقت من R2"""
-    import boto3
-    from botocore.client import Config
     s3 = boto3.client(
         's3',
         endpoint_url=os.environ.get('R2_ENDPOINT_URL'),
@@ -252,7 +253,6 @@ def process_dub(self, *args, **kwargs):
             prosody_audio_url = audio_url  # الافتراضي: لا تغيير
 
             # نفّذ نقل الـ prosody إذا كان endpoint معرفاً، ووسائط متاحة، وطلب المستخدم يسمح بذلك
-            # ملاحظة: apply_prosody افتراضياً False الآن
             if MODAL_PROSODY_URL and media_url and payload.get('apply_prosody', False):
                 headers = {}
                 if MODAL_PROSODY_KEY:
@@ -319,7 +319,6 @@ def process_dub(self, *args, **kwargs):
             # ===========================================
             # 🎬 VIDEO OUTPUT - منطق ذكي
             # ===========================================
-            # كشف نوع الملف من file_key أو من media_url
             source_str = (file_key or media_url or '').lower()
             video_exts = ['.mp4', '.mov', '.mkv', '.webm', '.avi', '.mpg', '.mpeg', '.m4v']
             is_video = any(ext in source_str for ext in video_exts)
@@ -387,10 +386,9 @@ def process_dub(self, *args, **kwargs):
                 db.session.commit()
             except Exception:
                 db.session.rollback()
-            try:
-                self.retry(exc=e, countdown=10)
-            except Exception:
-                pass
+            
+            # 🔥 الإصلاح هنا: السماح للمهمة بإعادة المحاولة
+            self.retry(exc=e, countdown=10)
 
 
 # ==========================================
@@ -452,10 +450,9 @@ def process_smart_tts(self, *args, **kwargs):
                 db.session.commit()
             except Exception:
                 db.session.rollback()
-            try:
-                self.retry(exc=e, countdown=10)
-            except Exception:
-                pass
+            
+            # 🔥 الإصلاح هنا
+            self.retry(exc=e, countdown=10)
 
 
 # ==========================================
@@ -528,11 +525,9 @@ def process_stt(self, *args, **kwargs):
                 db.session.commit()
             except Exception:
                 db.session.rollback()
-            try:
-                self.retry(exc=e, countdown=10)
-            except Exception:
-                pass
-
+            
+            # 🔥 الإصلاح هنا
+            self.retry(exc=e, countdown=10)
 
 # Backward compat alias
 process_tts = process_smart_tts
